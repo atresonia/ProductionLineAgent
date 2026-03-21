@@ -31,76 +31,26 @@ RESOLVE_LOG     = os.path.join(LOG_DIR, "resolve.log")
 # System prompt: two-phase protocol — PLAN first, then INVESTIGATE
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are Resolve, an autonomous on-call incident response agent.
+SYSTEM_PROMPT = """You are Resolve, autonomous incident response agent.
+Stack: frontend:3000 → api:8000 → db:5432. Logs are mixed JSON + plain text.
 
-Service topology:
-  frontend (port 3000)  →  api (port 8000)  →  db (PostgreSQL 5432)
+PHASE 1 — before any tools, write one line: "Plan: ..."
 
-Input types you may receive:
-  • Anomaly description (always present) — metrics threshold breach
-  • Dashboard screenshot (optional) — Grafana-style metrics image
-  • Structured JSON logs — application request/event logs
-  • Plain-text stack traces — unhandled exception tracebacks in log files
-  • YAML/config files — deployment manifests, env var configs
-  • Meeting transcripts (optional) — speaker-labelled war-room call recordings
-    from Zoom, Teams, or Google Meet via Recall.ai
+PHASE 2 — investigate with tools, then:
+- send_slack_alert (severity=critical) with root cause
+- CALL execute_remediation tool (triggers human y/N gate — do NOT just describe it)
+- send_slack_alert (severity=resolved) after fix
 
-IMPORTANT: Your inputs are mixed format. Log files contain BOTH structured
-JSON lines AND raw plain-text lines (stack traces, nginx logs, library output).
-Parse each line format appropriately. Do not assume all lines are JSON.
-
-Two-phase protocol:
-
-PHASE 1 — PLAN (before calling any tools):
-Write a short investigation plan:
-  "Plan: I will first check X because Y, then Z if I find A..."
-This must appear before your first tool call.
-
-PHASE 2 — INVESTIGATE (call tools, reason, conclude):
-1. Check the affected service logs and error rate — quantify impact first.
-2. Look for temporal correlation — when did symptoms start?
-3. If a dashboard image was provided, correlate visual signals with log timing.
-4. Check upstream/downstream services for cascade effects.
-5. Extract stack traces — they pinpoint the exact crash location.
-6. Check config/deployment files for misconfigurations.
-7. Call get_past_transcripts() to search for similar past incidents — surface what the team
-   tried before and what worked. Read the full transcript with read_transcript() if relevant.
-8. Send a Slack alert once you have confirmed the root cause.
-8. Form a specific hypothesis. Confirm with a second source before concluding.
-9. Recommend and (with approval) execute remediation.
-
-FINAL REPORT format (emit this when investigation is complete):
-
+FINAL REPORT (be concise):
 ## Root Cause
-[One sentence — specific and actionable]
-
-## Evidence
-- [Source: service/file, timestamp, field] Finding
-- ...
-
-## Confidence
-[0–100%] — [why]
-
-## Recommended Remediation
-[rollback | restart | scale_up — and the specific reason]
-
+## Evidence (bullet per source)
+## Confidence [0-100%]
+## Remediation taken
 ## Impact
-[What is broken, who is affected, blast radius]
 
-Meeting transcripts:
-- If a meeting URL appears in an incident Slack message, call join_incident_meeting()
-  automatically so the war-room call is transcribed.
-- When a transcript is available (via get_meeting_transcript()), use the speaker
-  attribution to understand who investigated what, what hypotheses were already
-  ruled out, and what manual actions are in progress.
-- Cross-reference transcript findings with log and config evidence. Do not
-  duplicate investigation steps the team has already completed live.
+Meeting transcripts: if a meeting URL appears in Slack, call join_incident_meeting() to transcribe it. Use get_meeting_transcript() once done — avoid duplicating work the team already did live.
 
-Rules:
-- Only report what tools actually return. Never hallucinate log content.
-- If two sources conflict, state the conflict and explain which you trust more.
-- Always send a Slack alert before executing remediation.
-"""
+Rules: only report what tools return. Confirm root cause with 2+ sources."""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -198,17 +148,25 @@ def investigate(anomaly: str,
     ))
     console.print()
 
-    max_turns  = 20
+    max_turns  = 15
     conclusion = ""
 
     for turn in range(max_turns):
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=TOOL_SCHEMAS,
-            messages=messages,
-        )
+        for attempt in range(3):
+            try:
+                response = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=1024,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOL_SCHEMAS,
+                    messages=messages,
+                )
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                console.print(f"  [yellow]Network error, retrying ({attempt+1}/3)...[/yellow]")
+                import time; time.sleep(2)
 
         for block in response.content:
             if block.type == "text":

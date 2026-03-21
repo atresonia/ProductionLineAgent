@@ -1,0 +1,62 @@
+[
+  {
+    "ts": "2026-03-18T14:23:00Z",
+    "user": "priya.sharma",
+    "channel": "#backend-team",
+    "text": "heads up — payment gateway URL changed. We migrated to the v2 endpoint. New URL is https://payments.internal/v2/charge. Will update the secrets but someone needs to update deployment.yaml too before the next deploy"
+  },
+  {
+    "ts": "2026-03-18T14:31:00Z",
+    "user": "marcus.chen",
+    "channel": "#backend-team",
+    "text": "Got it Priya. I'll add it to the v2.1 deploy checklist"
+  },
+  {
+    "ts": "2026-03-18T16:05:00Z",
+    "user": "daniel.wu",
+    "channel": "#deployments",
+    "text": "v2.1 deploy checklist complete. Reviewed DB migrations, env vars (checked secrets manager), load test passed. Going out tonight."
+  },
+  {
+    "ts": "2026-03-18T23:55:00Z",
+    "user": "deploy-bot",
+    "channel": "#deployments",
+    "text": "v2.1 deployed to production. api: 3 replicas healthy. frontend: 2 replicas healthy."
+  },
+  {
+    "ts": "2026-03-19T09:12:00Z",
+    "user": "priya.sharma",
+    "channel": "#backend-team",
+    "text": "btw I just realized deployment.yaml still has the old payment gateway URL. The secrets got updated but not the config file. Someone should fix that — if a pod restarts and picks up the config file value instead of the secret it'll break"
+  },
+  {
+    "ts": "2026-03-19T09:45:00Z",
+    "user": "marcus.chen",
+    "channel": "#backend-team",
+    "text": "Adding it to the backlog, will fix in v2.1.1"
+  },
+  {
+    "ts": "2026-03-20T11:00:00Z",
+    "user": "sarah.kim",
+    "channel": "#incidents",
+    "text": "Reminder: we had a payment gateway URL issue on March 3rd. Same root cause — stale URL in config. If this fires again, rollback is fastest, but remember to also update the config before the next deploy forward."
+  },
+  {
+    "ts": "2026-03-20T14:30:00Z",
+    "user": "daniel.wu",
+    "channel": "#platform",
+    "text": "Seeing some elevated memory on api service — around 480MB. Still within limits but worth watching. Load gen has been running at 2x normal for the perf test."
+  },
+  {
+    "ts": "2026-03-21T08:00:00Z",
+    "user": "priya.sharma",
+    "channel": "#backend-team",
+    "text": "Team — I'm in planning sessions all morning (9am-12pm). Marcus is best point of contact for anything payments-related until afternoon."
+  },
+  {
+    "ts": "2026-03-21T08:05:00Z",
+    "user": "marcus.chen",
+    "channel": "#backend-team",
+    "text": "On it. I'm free all morning."
+  }
+]

@@ -1,0 +1,70 @@
+{
+  "team": [
+    {
+      "name": "Marcus Chen",
+      "email": "marcus@company.com",
+      "slack_handle": "@marcus.chen",
+      "role": "Senior Backend Engineer",
+      "expertise": ["payments", "api", "database", "deployment"],
+      "past_incidents_resolved": ["payment_gateway_failures", "bad_deploy", "slow_db"],
+      "availability": {
+        "status": "available",
+        "note": "Free all morning, confirmed in Slack"
+      },
+      "calendar": []
+    },
+    {
+      "name": "Priya Sharma",
+      "email": "priya@company.com",
+      "slack_handle": "@priya.sharma",
+      "role": "Payments Lead",
+      "expertise": ["payments", "payment_gateway", "checkout_flow"],
+      "past_incidents_resolved": ["payment_gateway_failures"],
+      "availability": {
+        "status": "busy",
+        "note": "In planning sessions 9am-12pm, confirmed in Slack"
+      },
+      "calendar": [
+        {
+          "title": "Q2 Planning",
+          "start": "2026-03-21T09:00:00Z",
+          "end": "2026-03-21T12:00:00Z",
+          "type": "meeting"
+        }
+      ]
+    },
+    {
+      "name": "Daniel Wu",
+      "email": "daniel@company.com",
+      "slack_handle": "@daniel.wu",
+      "role": "SRE",
+      "expertise": ["infrastructure", "kubernetes", "monitoring", "database"],
+      "past_incidents_resolved": ["db_down", "memory_leak", "slow_db"],
+      "availability": {
+        "status": "available",
+        "note": "No meetings scheduled"
+      },
+      "calendar": []
+    },
+    {
+      "name": "Sarah Kim",
+      "email": "sarah@company.com",
+      "slack_handle": "@sarah.kim",
+      "role": "Backend Engineer",
+      "expertise": ["api", "caching", "performance"],
+      "past_incidents_resolved": ["memory_leak"],
+      "availability": {
+        "status": "busy",
+        "note": "On PTO until March 23rd"
+      },
+      "calendar": [
+        {
+          "title": "PTO",
+          "start": "2026-03-21T00:00:00Z",
+          "end": "2026-03-23T23:59:00Z",
+          "type": "pto"
+        }
+      ]
+    }
+  ]
+}

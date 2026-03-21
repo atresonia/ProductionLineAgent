@@ -1,0 +1,29 @@
+INCIDENT CALL TRANSCRIPT — 2026-03-03 02:14 UTC
+Participants: Marcus (on-call), Priya (payments lead), Daniel (SRE)
+
+[02:14] Marcus: Okay I'm seeing 500s on /checkout, PagerDuty just fired. Error rate is 78%.
+
+[02:16] Priya: I pushed a config change to the payment gateway URL yesterday. Let me check...
+
+[02:17] Priya: Oh no. The PAYMENT_GATEWAY_URL in deployment.yaml still points to the old endpoint. We migrated the payment gateway last week and I updated the secret in prod but not the config file.
+
+[02:18] Marcus: How do we fix this fast?
+
+[02:19] Priya: Two things — update the env var in the deployment config AND restart the api service. Don't just update the env var, you need to restart the service or it won't pick up the new value. Kubernetes won't auto-reload env vars.
+
+[02:20] Daniel: Agreed. Also worth noting — the stale URL returns a 503, which is why the api is returning 500 to the frontend. Classic config drift.
+
+[02:21] Marcus: Rolling back the deploy to v2.0 now. That had the correct URL.
+
+[02:22] Daniel: Rollback looks clean. Error rate dropping... 45%... 12%... 2%... we're good.
+
+[02:23] Marcus: Nice. Note for the post-mortem: the root cause was a stale PAYMENT_GATEWAY_URL in deployment.yaml after the payment gateway migration. Fix was rollback to v2.0. Prevention: add config validation step to deploy pipeline that checks env vars against the secrets registry before a deploy goes out.
+
+[02:24] Priya: Also we should add an integration test that actually pings the payment gateway URL from the config. Would have caught this immediately.
+
+[02:25] Marcus: Good call. I'll write this up. Resolved in 11 minutes.
+
+INCIDENT RESOLVED: 02:25 UTC
+Root cause: PAYMENT_GATEWAY_URL env var pointed to decommissioned endpoint after gateway migration
+Fix applied: Rollback api to v2.0
+MTTR: 11 minutes

@@ -24,6 +24,10 @@ ASSETS_DIR  = os.getenv("ASSETS_DIR", "./assets")
 CHAOS_FILE  = os.path.join(os.getenv("CHAOS_DIR", "./chaos"), "current_fault")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
 
+from memory_tools import search_past_incidents, search_runbooks, search_slack
+from calendar_tools import get_team_availability
+from audio_tools import transcribe_recording, get_past_transcripts
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _read_log_lines(service: str) -> list[str]:
@@ -50,7 +54,7 @@ def _parse_entries(lines: list[str], since: datetime | None = None) -> list[dict
 
 # ── tool implementations ──────────────────────────────────────────────────────
 
-def read_logs(service: str, lines: int = 60) -> str:
+def read_logs(service: str, lines: int = 30) -> str:
     """Return the last N raw log lines for a service."""
     all_lines = _read_log_lines(service)
     if not all_lines:
@@ -64,7 +68,7 @@ def search_logs(service: str, keyword: str, lines: int = 200) -> str:
     matches = [l for l in all_lines[-lines:] if keyword.lower() in l.lower()]
     if not matches:
         return f"[no lines containing '{keyword}' in last {lines} lines of {service}]"
-    return "".join(matches[-40:])
+    return "".join(matches[-15:])
 
 
 def get_error_rate(service: str, window_minutes: int = 5) -> str:
@@ -85,7 +89,7 @@ def get_error_rate(service: str, window_minutes: int = 5) -> str:
     recent_errors = [
         {"time": e.get("timestamp","?")[-8:], "endpoint": e.get("endpoint","?"),
          "status": e.get("status_code"), "error": e.get("error","?")}
-        for e in errors[-5:]
+        for e in errors[-3:]
     ]
     return json.dumps({
         "service":          service,
@@ -145,7 +149,7 @@ def get_memory_trend(service: str, window_minutes: int = 10) -> str:
         "last_mb":        last_mb,
         "delta_mb":       delta,
         "trend":          trend,
-        "samples":        readings[-8:],
+        "samples":        readings[-4:],
     }, indent=2)
 
 
@@ -155,7 +159,7 @@ def get_recent_errors(service: str, limit: int = 20) -> str:
     error_lines = [l for l in all_lines if '"level": "ERROR"' in l or '"level": "WARN"' in l]
     if not error_lines:
         return f"[no errors or warnings found for '{service}']"
-    return "".join(error_lines[-limit:])
+    return "".join(error_lines[-min(limit, 10):])
 
 
 def get_deploy_history(window_minutes: int = 60) -> str:
@@ -520,39 +524,70 @@ TOOL_SCHEMAS = [
         },
     },
     {
-        "name": "transcribe_recording",
-        "description": (
-            "Transcribe a local MP3/WAV/M4A incident call recording using OpenAI Whisper (runs on-device, no API key). "
-            "Pass just the filename — file must be in the assets/ directory. "
-            "Returns the full speaker transcript. If a cached transcript exists it is returned instantly."
-        ),
+        "name": "search_past_incidents",
+        "description": "Search past incident post-mortems and transcripts for similar patterns.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "filename": {
-                    "type": "string",
-                    "description": "Audio filename in assets/ e.g. incident_2026-03-10.mp3",
-                },
+                "query": {"type": "string", "description": "Keywords describing the current incident"},
             },
-            "required": ["filename"],
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_runbooks",
+        "description": "Search internal runbooks for response procedures relevant to the current incident type.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Keywords to find the relevant runbook"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_slack",
+        "description": "Search Slack channel history for related discussions, warnings, or recent changes. Often surfaces the signal that explains the incident.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Keywords to search in Slack messages"},
+                "limit": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_team_availability",
+        "description": "Check which engineers are available and get a paging recommendation based on expertise and past incident history.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "incident_type": {"type": "string", "description": "Incident type hint (e.g. 'payment', 'memory', 'database', 'deploy')"},
+            },
+            "required": [],
         },
     },
     {
         "name": "get_past_transcripts",
-        "description": (
-            "List all available incident call transcripts. Optionally filter by keyword to find relevant past incidents. "
-            "Use this to surface institutional knowledge from past incident war-room calls — "
-            "what the team tried, what worked, and what was ruled out."
-        ),
+        "description": "Search transcribed recordings of past incident calls for institutional knowledge.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Optional keyword to filter transcripts (e.g. 'payment', 'memory', 'rollback')",
-                },
+                "query": {"type": "string", "description": "Keywords to find relevant incident call transcripts"},
             },
-            "required": [],
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "transcribe_recording",
+        "description": "Transcribe an audio recording (MP3/WAV) using Whisper. Pass just the filename from assets/.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "Audio filename in assets/ e.g. incident_2026-03-10.mp3"},
+            },
+            "required": ["filename"],
         },
     },
     {
@@ -561,49 +596,29 @@ TOOL_SCHEMAS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "filename": {
-                    "type": "string",
-                    "description": "Transcript filename (e.g. incident_2026-03-10_bad_deploy.txt)",
-                },
+                "filename": {"type": "string", "description": "Transcript filename"},
             },
             "required": ["filename"],
         },
     },
     {
         "name": "join_incident_meeting",
-        "description": (
-            "Send a Recall.ai bot into an incident war-room meeting to transcribe it. "
-            "Accepts any meeting URL — Zoom, Microsoft Teams, Google Meet, Webex, or Slack Huddles. "
-            "Call this automatically when a meeting URL appears in an incident Slack message. "
-            "Returns a bot_id you can pass to get_meeting_transcript() once the meeting ends."
-        ),
+        "description": "Send a Recall.ai bot into an incident war-room meeting (Zoom, Teams, Meet, Webex, Slack Huddle) to transcribe it. Returns a bot_id.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "meeting_url": {
-                    "type": "string",
-                    "description": "Full meeting URL (Zoom, Teams, Meet, Webex, or Slack Huddle)",
-                },
+                "meeting_url": {"type": "string", "description": "Full meeting URL"},
             },
             "required": ["meeting_url"],
         },
     },
     {
         "name": "get_meeting_transcript",
-        "description": (
-            "Retrieve the speaker-labelled transcript for a completed meeting. "
-            "First checks for a locally finalised file written by the webhook server, "
-            "then falls back to the Recall.ai API. Use this after join_incident_meeting "
-            "once the meeting has ended to extract what the team investigated, ruled out, "
-            "and manually actioned — avoid duplicating their live work."
-        ),
+        "description": "Retrieve the speaker-labelled transcript for a completed meeting bot.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "bot_id": {
-                    "type": "string",
-                    "description": "The bot_id returned by join_incident_meeting",
-                },
+                "bot_id": {"type": "string", "description": "The bot_id returned by join_incident_meeting"},
             },
             "required": ["bot_id"],
         },
@@ -613,21 +628,25 @@ TOOL_SCHEMAS = [
 # ── dispatch ──────────────────────────────────────────────────────────────────
 
 TOOL_FN_MAP = {
-    "read_logs":           lambda i: read_logs(i["service"], i.get("lines", 60)),
-    "search_logs":         lambda i: search_logs(i["service"], i["keyword"], i.get("lines", 200)),
-    "get_error_rate":      lambda i: get_error_rate(i["service"], i.get("window_minutes", 5)),
-    "get_latency_stats":   lambda i: get_latency_stats(i["service"], i.get("window_minutes", 5)),
-    "get_memory_trend":    lambda i: get_memory_trend(i["service"], i.get("window_minutes", 10)),
-    "get_recent_errors":   lambda i: get_recent_errors(i["service"], i.get("limit", 20)),
-    "get_deploy_history":  lambda i: get_deploy_history(i.get("window_minutes", 60)),
-    "list_services":       lambda i: list_services(),
-    "read_config_file":    lambda i: read_config_file(i["filename"]),
-    "list_config_files":   lambda i: list_config_files(),
-    "parse_stack_traces":  lambda i: parse_stack_traces(i["service"], i.get("limit", 5)),
-    "send_slack_alert":    lambda i: send_slack_alert(i["message"], i.get("severity", "warning")),
+    "read_logs":              lambda i: read_logs(i["service"], i.get("lines", 30)),
+    "search_logs":            lambda i: search_logs(i["service"], i["keyword"], i.get("lines", 200)),
+    "get_error_rate":         lambda i: get_error_rate(i["service"], i.get("window_minutes", 5)),
+    "get_latency_stats":      lambda i: get_latency_stats(i["service"], i.get("window_minutes", 5)),
+    "get_memory_trend":       lambda i: get_memory_trend(i["service"], i.get("window_minutes", 10)),
+    "get_recent_errors":      lambda i: get_recent_errors(i["service"], i.get("limit", 20)),
+    "get_deploy_history":     lambda i: get_deploy_history(i.get("window_minutes", 60)),
+    "list_services":          lambda i: list_services(),
+    "read_config_file":       lambda i: read_config_file(i["filename"]),
+    "list_config_files":      lambda i: list_config_files(),
+    "parse_stack_traces":     lambda i: parse_stack_traces(i["service"], i.get("limit", 5)),
+    "send_slack_alert":       lambda i: send_slack_alert(i["message"], i.get("severity", "warning")),
     "execute_remediation":    lambda i: execute_remediation(i["action"], i.get("service", "api")),
-    "transcribe_recording":   lambda i: transcribe_recording(i["filename"]),
+    "search_past_incidents":  lambda i: search_past_incidents(i["query"]),
+    "search_runbooks":        lambda i: search_runbooks(i["query"]),
+    "search_slack":           lambda i: search_slack(i["query"], i.get("limit", 10)),
+    "get_team_availability":  lambda i: get_team_availability(i.get("incident_type", "")),
     "get_past_transcripts":   lambda i: get_past_transcripts(i.get("query", "")),
+    "transcribe_recording":   lambda i: transcribe_recording(i.get("filename") or i.get("audio_path", "")),
     "read_transcript":        lambda i: read_transcript(i["filename"]),
     "join_incident_meeting":  lambda i: join_incident_meeting(i["meeting_url"]),
     "get_meeting_transcript": lambda i: get_meeting_transcript(i["bot_id"]),

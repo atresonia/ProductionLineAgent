@@ -1,0 +1,42 @@
+WHISPER TRANSCRIPTION
+Source: 2026-03-03_incident_call.mp3
+Transcribed: 2026-03-03T02:30:00Z
+Duration: 11m 24s
+Model: whisper-base
+
+---
+
+Okay everyone's on. Marcus, what are we seeing?
+
+Yeah so PagerDuty fired about two minutes ago. Error rate is uh seventy-eight percent on slash checkout. Frontend is getting five-hundreds back from the API. Everything else looks fine, slash products is healthy.
+
+Priya are you on? You pushed a config change yesterday right?
+
+Yeah I'm here. Oh god. I think I know what this is. The payment gateway migrated to the v2 endpoint last week. I updated the secret in the secrets manager but I think I forgot to update deployment dot yaml.
+
+So the URL in the config file is still pointing to the old endpoint?
+
+Yeah the old one is legacy-payments.internal slash v1 slash charge. That one's decommissioned. New one is payments.internal slash v2 slash charge.
+
+Okay so what's the fastest fix here?
+
+Rollback to v2.0. That build had the correct URL baked in before the migration. It's the cleanest path.
+
+One important thing — when we fix this, don't just update the env var and call it done. You need to restart the service or the pod won't pick up the new value. Kubernetes doesn't hot-reload environment variables. We got burned by that once before.
+
+Good call Daniel. Okay I'm initiating rollback to v2.0 now.
+
+Also worth noting for the post-mortem — the stale URL returns a five-oh-three from the old gateway, which is why the API is returning five hundred to the frontend. Classic config drift scenario.
+
+Rollback is running. Error rate is coming down... forty-five... twenty... seven... we're under five percent. Looks clean.
+
+Great. MTTR is going to be about eleven minutes. Not bad for three AM.
+
+For the post-mortem action items: we need a config validation step in the deploy pipeline. Like a pre-deploy check that cross-references env vars in the YAML against what's in the secrets manager. That would have caught this before it ever went out.
+
+Agreed. And an integration test that actually pings the payment gateway health endpoint using the URL from the config file.
+
+I'll write this up. Thanks everyone.
+
+---
+END OF TRANSCRIPT
