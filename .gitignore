@@ -205,3 +205,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Runtime directories — tracked as empty via .gitkeep
+logs/*
+!logs/.gitkeep
+chaos/*
+!chaos/.gitkeep
+
+# Generated assets
+assets/
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+
+# Postmortems (generated at runtime)
+postmortems/
