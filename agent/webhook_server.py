@@ -24,7 +24,7 @@ import os
 
 from flask import Flask, request, jsonify
 
-from meeting_bot import buffer_transcript_chunk, finalize_transcript
+from meeting_bot import buffer_transcript_chunk, finalize_transcript, post_meeting_to_slack_and_memory
 
 app  = Flask(__name__)
 PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
@@ -86,6 +86,9 @@ def meeting_end_webhook():
 
     path = finalize_transcript(bot_id)
     print(f"[webhook] transcript finalised → {path}")
+
+    # Post summary to Slack + index into institutional memory
+    post_meeting_to_slack_and_memory(bot_id, path)
 
     return jsonify({"ok": True, "transcript_path": path})
 
