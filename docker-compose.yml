@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: resolve
+      POSTGRES_PASSWORD: resolve
+      POSTGRES_DB: shopdb
+    volumes:
+      - ./services/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resolve -d shopdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  api:
+    build: ./services/api
+    environment:
+      DB_HOST: db
+      DB_USER: resolve
+      DB_PASSWORD: resolve
+      DB_NAME: shopdb
+    volumes:
+      - ./logs:/app/logs
+      - ./chaos:/app/chaos
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./services/frontend
+    environment:
+      API_URL: http://api:8000
+    volumes:
+      - ./logs:/app/logs
+      - ./chaos:/app/chaos
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
