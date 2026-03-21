@@ -13,6 +13,7 @@ import json
 import os
 import urllib.request
 import urllib.error
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
 from meeting_bot import join_meeting_and_transcribe, get_bot_transcript
@@ -374,6 +375,107 @@ def get_meeting_transcript(bot_id: str) -> str:
     return get_bot_transcript(bot_id)
 
 
+def capture_dashboard(window_minutes: int = 15) -> str:
+    """
+    Generate a live dashboard screenshot and return its path plus a text summary.
+
+    Captures per-minute error rate, p95 latency, and memory trend from log data,
+    renders a dark-themed 3-panel PNG, and computes the failure shape (cliff /
+    ramp / step) from the spike pattern.  The returned ``image_path`` key signals
+    to investigator.py that the PNG should be injected as a vision block.
+    """
+    try:
+        from dashboard import generate_dashboard  # type: ignore[import]
+    except ImportError:
+        return json.dumps({"error": "dashboard module unavailable — install matplotlib and numpy"})
+
+    try:
+        image_path = generate_dashboard(window_minutes)
+    except Exception as exc:
+        return json.dumps({"error": f"dashboard generation failed: {exc}"})
+
+    # ── Compute summary metrics from the same log data ────────────────────────
+    since   = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    entries = _parse_entries(_read_log_lines("api"), since=since)
+
+    # Error rate
+    requests = [e for e in entries if e.get("event") == "request"]
+    errors   = [e for e in requests if e.get("status_code", 200) >= 400]
+    overall_error_rate = round(len(errors) / len(requests) * 100, 1) if requests else 0.0
+
+    # p95 latency
+    latencies = sorted(
+        e["latency_ms"] for e in requests if "latency_ms" in e
+    )
+    if latencies:
+        p95_ms: float | str = latencies[min(int(len(latencies) * 0.95), len(latencies) - 1)]
+    else:
+        p95_ms = "n/a"
+
+    # Memory trend
+    mem_readings = sorted(
+        [(e["timestamp"], float(e["memory_mb"])) for e in entries if "memory_mb" in e]
+    )
+    if len(mem_readings) >= 2:
+        first_mb = mem_readings[0][1]
+        last_mb  = mem_readings[-1][1]
+        delta_mb = round(last_mb - first_mb, 1)
+        mem_trend = "GROWING" if delta_mb > 10 else "stable" if abs(delta_mb) < 5 else "shrinking"
+    else:
+        first_mb = last_mb = delta_mb = 0.0
+        mem_trend = "unknown"
+
+    # Per-minute error rates — find the minute with the biggest spike
+    req_by_min: dict[str, int] = defaultdict(int)
+    err_by_min: dict[str, int] = defaultdict(int)
+    for e in requests:
+        key = e.get("timestamp", "")[:16]  # "YYYY-MM-DDTHH:MM"
+        req_by_min[key] += 1
+        if e.get("status_code", 200) >= 400:
+            err_by_min[key] += 1
+
+    peak_minute: str | None = None
+    peak_rate = 0.0
+    for key, total in req_by_min.items():
+        rate = err_by_min[key] / total * 100
+        if rate > peak_rate:
+            peak_rate = rate
+            peak_minute = key[-5:]  # "HH:MM"
+
+    # Infer failure shape from signal pattern
+    if peak_rate > 50:
+        shape = "cliff (sudden drop — likely bad deploy or config change)"
+    elif mem_trend == "GROWING":
+        shape = "ramp (gradual rise — likely memory leak)"
+    elif isinstance(p95_ms, (int, float)) and p95_ms > 1500:
+        shape = "step (latency plateau — likely DB or downstream threshold)"
+    else:
+        shape = "unclear — review dashboard visually"
+
+    summary_parts = [
+        f"error rate {overall_error_rate}% over last {window_minutes}min",
+        f"p95 latency {p95_ms}{'ms' if p95_ms != 'n/a' else ''}",
+        f"memory {mem_trend} ({delta_mb:+.1f} MB)",
+    ]
+    if peak_minute:
+        summary_parts.append(f"peak {peak_rate:.1f}% errors at {peak_minute}")
+    summary_parts.append(f"shape → {shape}")
+
+    return json.dumps({
+        "image_path": image_path,
+        "summary": " | ".join(summary_parts),
+        "metrics": {
+            "error_rate_pct":      overall_error_rate,
+            "p95_latency_ms":      p95_ms,
+            "memory_trend":        mem_trend,
+            "memory_delta_mb":     delta_mb,
+            "peak_error_minute":   peak_minute,
+            "peak_error_rate_pct": round(peak_rate, 1),
+            "failure_shape":       shape,
+        },
+    }, indent=2)
+
+
 # ── Anthropic tool schema ─────────────────────────────────────────────────────
 
 TOOL_SCHEMAS = [
@@ -569,6 +671,27 @@ TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "capture_dashboard",
+        "description": (
+            "Capture a live dashboard screenshot showing error rate, latency, and memory "
+            "trends. Use this after quantifying impact with log tools to correlate visual "
+            "spike shapes with incident timing. The spike shape reveals whether the failure "
+            "is a cliff (deploy), ramp (leak), or step (threshold). Returns both a text "
+            "summary and a dashboard image for visual analysis."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "window_minutes": {
+                    "type": "integer",
+                    "default": 15,
+                    "description": "How many minutes of history to include in the dashboard",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "get_past_transcripts",
         "description": "Search transcribed recordings of past incident calls for institutional knowledge.",
         "input_schema": {
@@ -650,6 +773,7 @@ TOOL_FN_MAP = {
     "read_transcript":        lambda i: read_transcript(i["filename"]),
     "join_incident_meeting":  lambda i: join_incident_meeting(i["meeting_url"]),
     "get_meeting_transcript": lambda i: get_meeting_transcript(i["bot_id"]),
+    "capture_dashboard":      lambda i: capture_dashboard(i.get("window_minutes", 15)),
 }
 
 def dispatch(name: str, inputs: dict) -> str:

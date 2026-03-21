@@ -15,7 +15,7 @@ import base64
 import json
 import os
 from datetime import datetime, timezone
-from anthropic import Anthropic
+from model_client import ModelClient
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -119,7 +119,7 @@ def investigate(anomaly: str,
 
     Returns dict with: conclusion, messages
     """
-    client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    client = ModelClient()
 
     # ── Build initial user message (text + optional image) ────────────────
     if image_path and os.path.exists(image_path):
@@ -152,21 +152,7 @@ def investigate(anomaly: str,
     conclusion = ""
 
     for turn in range(max_turns):
-        for attempt in range(3):
-            try:
-                response = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=1024,
-                    system=SYSTEM_PROMPT,
-                    tools=TOOL_SCHEMAS,
-                    messages=messages,
-                )
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                console.print(f"  [yellow]Network error, retrying ({attempt+1}/3)...[/yellow]")
-                import time; time.sleep(2)
+        response = client.chat(SYSTEM_PROMPT, messages, TOOL_SCHEMAS)
 
         for block in response.content:
             if block.type == "text":
@@ -215,10 +201,33 @@ def investigate(anomaly: str,
                     result = dispatch(block.name, block.input)
 
                 _print_tool_result(block.name, result)
+
+                # If the tool returned an image_path, attach the image as a
+                # vision content block alongside the text summary.
+                tool_content: str | list = result
+                try:
+                    result_data = json.loads(result)
+                    if isinstance(result_data, dict) and "image_path" in result_data:
+                        image_block = _build_image_block(result_data["image_path"])
+                        if image_block:
+                            tool_content = [
+                                {"type": "text", "text": result},
+                                image_block,
+                            ]
+                            _ilog({"event": "image_attached",
+                                   "path": result_data["image_path"]})
+                            console.print(
+                                "  [bold magenta]"
+                                "[Dashboard image attached — model analyzing visual signal]"
+                                "[/bold magenta]"
+                            )
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+
                 tool_results.append({
                     "type":        "tool_result",
                     "tool_use_id": block.id,
-                    "content":     result,
+                    "content":     tool_content,
                 })
 
             messages.append({"role": "user", "content": tool_results})
