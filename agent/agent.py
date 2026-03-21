@@ -50,6 +50,7 @@ if not os.getenv("ANTHROPIC_API_KEY"):
 from investigator import investigate
 from monitor import run as run_monitor, check_once
 from postmortem import generate as generate_postmortem
+from slack_watcher import SlackWatcher
 
 # ── Demo fault descriptions ───────────────────────────────────────────────────
 
@@ -146,7 +147,8 @@ def main():
         handle_incident(anomaly, image_path=image_path)
 
     else:
-        # Continuous monitor mode
+        # Continuous monitor mode — also watch Slack for meeting URLs
+        SlackWatcher().start()
         run_monitor(on_anomaly=handle_incident)
 
 

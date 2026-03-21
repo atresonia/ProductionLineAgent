@@ -15,6 +15,9 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 
+from meeting_bot import join_meeting_and_transcribe, get_bot_transcript
+from transcriber import transcribe_file, list_transcripts, get_transcript_content
+
 LOG_DIR     = os.getenv("LOG_DIR",    "./logs")
 CONFIG_DIR  = os.getenv("CONFIG_DIR", "./configs")
 ASSETS_DIR  = os.getenv("ASSETS_DIR", "./assets")
@@ -324,6 +327,49 @@ def list_config_files() -> str:
         return json.dumps({"config_dir": CONFIG_DIR, "files": [], "note": "directory not found"})
 
 
+def transcribe_recording(filename: str) -> str:
+    """
+    Transcribe an MP3/WAV incident call recording using Whisper (runs locally).
+    Pass just the filename — file must be in the assets/ directory.
+    If a transcript already exists for this file it is returned immediately.
+    """
+    return transcribe_file(filename)
+
+
+def get_past_transcripts(query: str = "") -> str:
+    """
+    List available incident call transcripts, optionally filtered by keyword.
+    Returns file names, excerpts, and paths. Use this to discover what past
+    recordings have been transcribed and find relevant institutional knowledge.
+    """
+    return list_transcripts(query)
+
+
+def read_transcript(filename: str) -> str:
+    """Read the full content of a saved transcript file."""
+    return get_transcript_content(filename)
+
+
+def join_incident_meeting(meeting_url: str) -> str:
+    """
+    Send a Recall.ai bot into any incident war-room meeting to transcribe it.
+    Accepts Zoom, Microsoft Teams, Google Meet, Webex, or Slack Huddle URLs.
+    Returns the bot_id — pass it to get_meeting_transcript() to retrieve the
+    finished transcript once the meeting ends.
+    """
+    result = join_meeting_and_transcribe(meeting_url)
+    return json.dumps(result, indent=2)
+
+
+def get_meeting_transcript(bot_id: str) -> str:
+    """
+    Retrieve the speaker-labelled transcript for a meeting bot.
+    First checks for a locally written file (written by the webhook server
+    when the meeting ended), then falls back to polling the Recall.ai API.
+    """
+    return get_bot_transcript(bot_id)
+
+
 # ── Anthropic tool schema ─────────────────────────────────────────────────────
 
 TOOL_SCHEMAS = [
@@ -473,6 +519,95 @@ TOOL_SCHEMAS = [
             "required": ["action"],
         },
     },
+    {
+        "name": "transcribe_recording",
+        "description": (
+            "Transcribe a local MP3/WAV/M4A incident call recording using OpenAI Whisper (runs on-device, no API key). "
+            "Pass just the filename — file must be in the assets/ directory. "
+            "Returns the full speaker transcript. If a cached transcript exists it is returned instantly."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "Audio filename in assets/ e.g. incident_2026-03-10.mp3",
+                },
+            },
+            "required": ["filename"],
+        },
+    },
+    {
+        "name": "get_past_transcripts",
+        "description": (
+            "List all available incident call transcripts. Optionally filter by keyword to find relevant past incidents. "
+            "Use this to surface institutional knowledge from past incident war-room calls — "
+            "what the team tried, what worked, and what was ruled out."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional keyword to filter transcripts (e.g. 'payment', 'memory', 'rollback')",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "read_transcript",
+        "description": "Read the full content of a saved transcript file by filename.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "Transcript filename (e.g. incident_2026-03-10_bad_deploy.txt)",
+                },
+            },
+            "required": ["filename"],
+        },
+    },
+    {
+        "name": "join_incident_meeting",
+        "description": (
+            "Send a Recall.ai bot into an incident war-room meeting to transcribe it. "
+            "Accepts any meeting URL — Zoom, Microsoft Teams, Google Meet, Webex, or Slack Huddles. "
+            "Call this automatically when a meeting URL appears in an incident Slack message. "
+            "Returns a bot_id you can pass to get_meeting_transcript() once the meeting ends."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "meeting_url": {
+                    "type": "string",
+                    "description": "Full meeting URL (Zoom, Teams, Meet, Webex, or Slack Huddle)",
+                },
+            },
+            "required": ["meeting_url"],
+        },
+    },
+    {
+        "name": "get_meeting_transcript",
+        "description": (
+            "Retrieve the speaker-labelled transcript for a completed meeting. "
+            "First checks for a locally finalised file written by the webhook server, "
+            "then falls back to the Recall.ai API. Use this after join_incident_meeting "
+            "once the meeting has ended to extract what the team investigated, ruled out, "
+            "and manually actioned — avoid duplicating their live work."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bot_id": {
+                    "type": "string",
+                    "description": "The bot_id returned by join_incident_meeting",
+                },
+            },
+            "required": ["bot_id"],
+        },
+    },
 ]
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
@@ -490,7 +625,12 @@ TOOL_FN_MAP = {
     "list_config_files":   lambda i: list_config_files(),
     "parse_stack_traces":  lambda i: parse_stack_traces(i["service"], i.get("limit", 5)),
     "send_slack_alert":    lambda i: send_slack_alert(i["message"], i.get("severity", "warning")),
-    "execute_remediation": lambda i: execute_remediation(i["action"], i.get("service", "api")),
+    "execute_remediation":    lambda i: execute_remediation(i["action"], i.get("service", "api")),
+    "transcribe_recording":   lambda i: transcribe_recording(i["filename"]),
+    "get_past_transcripts":   lambda i: get_past_transcripts(i.get("query", "")),
+    "read_transcript":        lambda i: read_transcript(i["filename"]),
+    "join_incident_meeting":  lambda i: join_incident_meeting(i["meeting_url"]),
+    "get_meeting_transcript": lambda i: get_meeting_transcript(i["bot_id"]),
 }
 
 def dispatch(name: str, inputs: dict) -> str:
