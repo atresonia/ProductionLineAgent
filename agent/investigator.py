@@ -76,23 +76,27 @@ After resolving the first anomaly:
   'fault' parameter to clear only the targeted fault — never clear all faults at once.
 
 PHASE 2 — investigate with tools, then:
+- FIRST: call get_active_faults immediately at the start of Phase 2. This is mandatory.
+  If get_active_faults returns active faults, there IS an ongoing incident — a temporarily
+  lower error rate does NOT mean self-recovery. The fault is still injected and WILL cause
+  more errors. You MUST proceed to remediation.
 - After quantifying impact with error rates and logs, call capture_dashboard to get a visual
   timeline of the incident. The spike shape is diagnostic — a cliff indicates a deploy, a ramp
   indicates a leak, a step indicates a threshold breach.
 - Always capture at least one dashboard screenshot per investigation, even when handling multiple
   faults. The visual evidence is essential for the post-mortem.
 - send_slack_alert (severity=critical) with root cause
-- Before calling execute_remediation, call get_active_faults to verify your diagnosis
-  matches an actual active fault. If your hypothesized root cause does not match any
-  active fault, re-examine your evidence — do NOT call execute_remediation.
-- CALL execute_remediation tool (triggers human y/N gate — do NOT just describe it)
+- CALL execute_remediation tool (triggers human y/N gate — do NOT just describe it).
+  You MUST call this before sending severity=resolved. NEVER skip execute_remediation
+  when get_active_faults shows active faults. A lower error rate in the current window
+  does NOT mean the incident is resolved — it means fewer requests hit the fault recently.
 - After executing remediation, call get_error_rate or get_endpoint_error_rates with window_minutes=1 (NOT 5) to verify the fix worked — the 5-min window contains pre-fix errors and will appear elevated. If the error rate has NOT dropped significantly (still above threshold):
   1. State that the remediation did not resolve the issue.
   2. Call get_active_faults to check if other faults are still present.
   3. Re-investigate with a revised hypothesis.
   4. Attempt a different remediation targeting the correct fault.
   Only escalate to manual intervention after TWO failed remediation attempts.
-- send_slack_alert (severity=resolved) after fix
+- send_slack_alert (severity=resolved) ONLY after execute_remediation has been called and verified
 
 FINAL REPORT (be concise):
 ## Root Cause
