@@ -267,6 +267,20 @@ def _build_nl_system() -> str:
         if remediations:
             acts = [r.get("action","?") for r in remediations]
             lines.append(f"REMEDIATIONS EXECUTED: {', '.join(acts)}")
+        # Check if a remediation is currently pending operator approval
+        pending = False
+        pending_desc = ""
+        for entry in reversed(entries):
+            ev = entry.get("event")
+            if ev == "tool_result" and entry.get("tool") == "execute_remediation":
+                break
+            if ev == "tool_call" and entry.get("tool") == "execute_remediation":
+                pending = True
+                inp = entry.get("inputs", {})
+                pending_desc = inp.get("description", "") or inp.get("action", "")
+                break
+        if pending:
+            lines.append(f"REMEDIATION PENDING APPROVAL (not yet executed): {pending_desc} — operator must click APPROVE in the dashboard first")
         if conclusion:
             lines.append(f"AGENT CONCLUSION (last reasoning): {conclusion[:300]}")
         agent_ctx = "\n".join(lines)
@@ -283,6 +297,7 @@ Rules:
 - ALWAYS use window_minutes=1 when checking error rate after a remediation — the 5-min window
   contains pre-fix errors and will show false positives. Only use window_minutes=5 for historical context.
 - If the agent has already executed a remediation, say so and check the 1-min window to confirm recovery.
+- If REMEDIATION PENDING APPROVAL is listed above, tell the operator it has NOT been executed yet and they must approve it in the dashboard. Do NOT say it was already run.
 - Do NOT recommend actions the agent already took unless the operator explicitly asks to retry.
 - Be concise and direct — no markdown tables for simple status updates.
 

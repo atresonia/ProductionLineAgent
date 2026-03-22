@@ -944,20 +944,27 @@ function applyState(s) {
     $('timer-lbl').textContent = 'NO ACTIVE INCIDENT';
   }
 
-  /* Service health (right sidebar rows) */
-  const apiSt = m.api?.status || 'unknown';
-  const feSt  = m.frontend?.status || 'unknown';
-  const dbSt  = fault==='db_down' ? 'degraded' : fault==='none' ? 'healthy' : 'healthy';
+  /* Service health (right sidebar rows)
+     When no active faults and error rate is 0, treat as healthy even if p95 is
+     still elevated — that's stale latency from the now-cleared fault. */
+  function svcStatus(svcData) {
+    if (!isActive && (svcData?.error_rate_pct ?? 0) === 0) return 'healthy';
+    return svcData?.status || 'unknown';
+  }
+  const apiSt = svcStatus(m.api);
+  const feSt  = svcStatus(m.frontend);
+  const dbSt  = faults.includes('db_down') ? 'degraded' : 'healthy';
   [['api',apiSt,'led-api','st-api'],['fe',feSt,'led-fe','st-fe'],['db',dbSt,'led-db','st-db']].forEach(([_,st,ledId,stId])=>{
     const l = $(ledId); if(l) { l.className='led '+(st==='healthy'?'healthy':st==='degraded'?'degraded':st==='warning'?'warning':''); }
     const s2 = $(stId); if(s2) { s2.textContent=st.toUpperCase(); s2.className='svc-status '+st; }
   });
 
-  /* health-list (legacy id kept for compat) */
+  /* health-list */
+  function ledCls(st) { return st==='healthy'?'healthy':st==='degraded'?'degraded':st==='warning'?'warning':''; }
   $('health-list').innerHTML = `
-    <div class="svc-row"><div class="svc-name"><div class="led ${apiSt==='healthy'?'healthy':apiSt==='degraded'?'degraded':apiSt==='warning'?'warning':''}"></div>api:8000</div><span class="svc-status ${apiSt}">${apiSt.toUpperCase()}</span></div>
-    <div class="svc-row"><div class="svc-name"><div class="led ${feSt==='healthy'?'healthy':feSt==='degraded'?'degraded':feSt==='warning'?'warning':''}"></div>frontend:3000</div><span class="svc-status ${feSt}">${feSt.toUpperCase()}</span></div>
-    <div class="svc-row"><div class="svc-name"><div class="led ${dbSt==='healthy'?'healthy':dbSt==='degraded'?'degraded':''}"></div>db:5432</div><span class="svc-status ${dbSt}">${dbSt.toUpperCase()}</span></div>`;
+    <div class="svc-row"><div class="svc-name"><div class="led ${ledCls(apiSt)}"></div>api:8000</div><span class="svc-status ${apiSt}">${apiSt.toUpperCase()}</span></div>
+    <div class="svc-row"><div class="svc-name"><div class="led ${ledCls(feSt)}"></div>frontend:3000</div><span class="svc-status ${feSt}">${feSt.toUpperCase()}</span></div>
+    <div class="svc-row"><div class="svc-name"><div class="led ${ledCls(dbSt)}"></div>db:5432</div><span class="svc-status ${dbSt}">${dbSt.toUpperCase()}</span></div>`;
 
   /* Metrics bars */
   setMetric('api-err','api-err-bar','api-p95','api-p95-bar','api-mem','api-mem-bar','led-api', m.api||{});
