@@ -77,8 +77,7 @@ PHASE 2 — investigate with tools, then:
   matches an actual active fault. If your hypothesized root cause does not match any
   active fault, re-examine your evidence — do NOT call execute_remediation.
 - CALL execute_remediation tool (triggers human y/N gate — do NOT just describe it)
-- After executing remediation, call get_error_rate or get_endpoint_error_rates to verify
-  the fix worked. If the error rate has NOT dropped significantly (still above threshold):
+- After executing remediation, call get_error_rate or get_endpoint_error_rates with window_minutes=1 (NOT 5) to verify the fix worked — the 5-min window contains pre-fix errors and will appear elevated. If the error rate has NOT dropped significantly (still above threshold):
   1. State that the remediation did not resolve the issue.
   2. Call get_active_faults to check if other faults are still present.
   3. Re-investigate with a revised hypothesis.
@@ -244,16 +243,66 @@ def investigate(anomaly: str,
                     if _approval_callback:
                         approved = _approval_callback(action, service, reason)
                     else:
+                        # Clear any stale decision file before waiting
+                        _approval_file = os.path.join(
+                            os.getenv("CHAOS_DIR", "../chaos"), "approval_decision"
+                        )
+                        try:
+                            os.remove(_approval_file)
+                        except FileNotFoundError:
+                            pass
+
                         console.print()
                         console.print(Panel(
                             f"[bold yellow]REMEDIATION REQUEST[/bold yellow]\n\n"
                             f"Action  : [cyan]{action}[/cyan]\n"
                             f"Service : [cyan]{service}[/cyan]\n\n"
-                            f"Approve? [y/N]",
+                            f"Approve? [y/N]  (or click APPROVE in the dashboard UI)",
                             border_style="yellow",
                         ))
-                        answer = input("  > ").strip().lower()
-                        approved = answer in ("y", "yes")
+
+                        # Poll approval file (written by dashboard) OR terminal input
+                        import threading, time as _time
+                        _decision = [None]
+
+                        def _poll_file():
+                            for _ in range(120):  # 2-min timeout
+                                try:
+                                    with open(_approval_file) as f:
+                                        val = f.read().strip().lower()
+                                    if val in ("y", "n"):
+                                        _decision[0] = val
+                                        return
+                                except FileNotFoundError:
+                                    pass
+                                _time.sleep(1)
+
+                        poller = threading.Thread(target=_poll_file, daemon=True)
+                        poller.start()
+
+                        # Also allow terminal input (non-blocking via thread)
+                        def _read_terminal():
+                            try:
+                                val = input("  > ").strip().lower()
+                                if _decision[0] is None:
+                                    _decision[0] = "y" if val in ("y", "yes") else "n"
+                            except Exception:
+                                pass
+
+                        term = threading.Thread(target=_read_terminal, daemon=True)
+                        term.start()
+
+                        # Wait for either
+                        while _decision[0] is None:
+                            _time.sleep(0.2)
+
+                        # Clean up file
+                        try:
+                            os.remove(_approval_file)
+                        except FileNotFoundError:
+                            pass
+
+                        approved = _decision[0] == "y"
 
                     if not approved:
                         result = '{"status": "rejected", "reason": "operator declined"}'

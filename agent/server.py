@@ -459,6 +459,7 @@ async def _monitor_loop() -> None:
     """
     Background task: mirrors monitor.py's anomaly detection.
     Polls check_once() every 5s; auto-starts investigation when threshold breached.
+    Also calls check_trends() each cycle for proactive early warnings.
     Debounces — won't re-trigger while an investigation is already running.
 
     Collection window: on first anomaly detection (healthy → unhealthy) waits
@@ -466,7 +467,7 @@ async def _monitor_loop() -> None:
     to cross their thresholds.  Emits {type: "collecting"} WS events during the
     window so the UI can show a "Scanning for additional issues…" indicator.
     """
-    from monitor import check_once, _build_anomaly_string
+    from monitor import check_once, _build_anomaly_string, check_trends, check_ml_predictions
     ready            = True
     collecting       = False
     collection_start = 0.0
@@ -475,7 +476,8 @@ async def _monitor_loop() -> None:
 
     while True:
         try:
-            anomalies = await asyncio.get_running_loop().run_in_executor(None, check_once)
+            loop      = asyncio.get_running_loop()
+            anomalies = await loop.run_in_executor(None, check_once)
 
             if anomalies and not _investigation_running and ready:
                 if not collecting:
@@ -529,6 +531,25 @@ async def _monitor_loop() -> None:
                     "message":   "System recovered — monitoring resumed",
                     "timestamp": _now(),
                 })
+
+            elif not anomalies:
+                # Rule-based trend warning
+                warning = await loop.run_in_executor(None, check_trends)
+                if warning:
+                    _emit({
+                        "type":      "proactive_warning",
+                        "message":   warning,
+                        "timestamp": _now(),
+                    })
+
+                # ML-based anomaly prediction
+                ml_warning = await loop.run_in_executor(None, check_ml_predictions)
+                if ml_warning:
+                    _emit({
+                        "type":      "ml_prediction",
+                        "message":   ml_warning,
+                        "timestamp": _now(),
+                    })
 
         except Exception:
             pass
@@ -802,6 +823,90 @@ async def trigger_custom(body: dict):
         return {"error": "anomaly field required"}
     started = await _start_investigation(anomaly)
     return {"status": "started" if started else "already investigating"}
+
+
+# ── Natural language chat endpoint ─────────────────────────────────────────────
+
+NL_SYSTEM = """You are Resolve, an ops assistant for a production system.
+Stack: frontend:3000 → api:8000 → db:5432.
+
+Answer questions and execute ops actions using the available tools.
+Be concise and direct. If asked to take an action (rollback, restart, check errors),
+call the appropriate tool and report what you find.
+
+Examples of what you handle:
+- "what's the current error rate?" → call get_error_rate
+- "show me recent checkout errors" → call get_recent_errors with service=api
+- "rollback the api" → call execute_remediation with action=rollback
+- "is the system healthy?" → call get_error_rate for both services
+- "what happened in the last incident?" → call search_past_incidents"""
+
+
+def _run_nl_chat(message: str) -> dict:
+    """Run a lightweight agentic loop for a natural language ops query."""
+    from model_client import ModelClient
+    from tools import TOOL_SCHEMAS, dispatch
+
+    client = ModelClient()
+    messages = [{"role": "user", "content": message}]
+    tool_calls_made = []
+    reply = ""
+
+    for _ in range(6):
+        response = client.chat(NL_SYSTEM, messages, TOOL_SCHEMAS)
+
+        if response.stop_reason == "end_turn":
+            for block in response.content:
+                if block.type == "text":
+                    reply = block.text
+            break
+
+        if response.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                tool_calls_made.append({"name": block.name, "inputs": block.input})
+                result = dispatch(block.name, block.input)
+                tool_results.append({
+                    "type":        "tool_result",
+                    "tool_use_id": block.id,
+                    "content":     result,
+                })
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            break
+
+    return {"reply": reply, "tool_calls": tool_calls_made}
+
+
+@app.post("/chat")
+async def chat(body: dict):
+    """
+    Natural language ops interface.
+
+    Body: {"message": "what's the error rate on api?"}
+    Returns: {"reply": "...", "tool_calls": [...]}
+
+    Also broadcasts the response to all connected WebSocket clients.
+    """
+    message = body.get("message", "")
+    if not message:
+        return {"error": "message field required"}
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _run_nl_chat, message)
+
+    _emit({
+        "type":       "chat_response",
+        "query":      message,
+        "reply":      result["reply"],
+        "tool_calls": result.get("tool_calls", []),
+        "timestamp":  _now(),
+    })
+
+    return result
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────

@@ -11,28 +11,56 @@ Usage:
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, jsonify, render_template, Response, stream_with_context
+from flask import Flask, jsonify, render_template, Response, stream_with_context, request, send_from_directory
+
+# Agent modules live one level up
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agent"))
+os.environ.setdefault("LOG_DIR",    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs"))
+os.environ.setdefault("CHAOS_DIR",  os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "chaos"))
+os.environ.setdefault("CONFIG_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs"))
+os.environ.setdefault("ASSETS_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"))
+os.environ.setdefault("DATA_DIR",   os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"))
 
 app = Flask(__name__)
 
 BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR       = os.path.join(BASE_DIR, "logs")
 CHAOS_FILE    = os.path.join(BASE_DIR, "chaos", "current_fault")
+CHAOS_JSON    = os.path.join(BASE_DIR, "chaos", "faults.json")
 RESOLVE_LOG   = os.path.join(LOG_DIR, "resolve.log")
 APPROVAL_FILE = os.path.join(BASE_DIR, "chaos", "approval_decision")
+ASSETS_DIR    = os.path.join(BASE_DIR, "assets")
 
 
 # ── Readers ────────────────────────────────────────────────────────────────────
 
-def _read_chaos() -> str:
+def _read_faults() -> list[str]:
+    """Return list of currently active faults (supports multi-fault JSON format)."""
+    try:
+        with open(CHAOS_JSON) as f:
+            data = json.load(f)
+        faults = data.get("active_faults", [])
+        if isinstance(faults, list) and faults:
+            return faults
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
     try:
         with open(CHAOS_FILE) as f:
-            return f.read().strip() or "none"
+            fault = f.read().strip()
+        if fault and fault != "none":
+            return [fault]
     except FileNotFoundError:
-        return "none"
+        pass
+    return []
+
+
+def _read_chaos() -> str:
+    faults = _read_faults()
+    return ",".join(faults) if faults else "none"
 
 
 def _read_log_lines(service: str) -> list[str]:
@@ -118,7 +146,8 @@ def _read_resolve_log() -> list[dict]:
 
 
 def _get_state() -> dict:
-    fault         = _read_chaos()
+    faults        = _read_faults()
+    fault         = ",".join(faults) if faults else "none"
     resolve_steps = _read_resolve_log()
 
     # Find the most recent investigation_start timestamp
@@ -141,12 +170,24 @@ def _get_state() -> dict:
             remediation_description = inp.get("description", "") or inp.get("action", "")
             break
 
+    # Find latest dashboard screenshot from image_attached events
+    dashboard_image = None
+    for entry in reversed(resolve_steps):
+        if entry.get("event") == "image_attached":
+            path = entry.get("path", "")
+            fname = os.path.basename(path)
+            if fname:
+                dashboard_image = f"/assets/{fname}"
+            break
+
     return {
         "fault":                    fault,
-        "incident_active":          fault != "none",
+        "faults":                   faults,
+        "incident_active":          bool(faults),
         "incident_start":           incident_start,
         "pending_remediation":      pending_remediation,
         "remediation_description":  remediation_description,
+        "dashboard_image":          dashboard_image,
         "metrics": {
             "api":      _get_metrics("api"),
             "frontend": _get_metrics("frontend"),
@@ -161,6 +202,11 @@ def _get_state() -> dict:
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/assets/<path:filename>")
+def assets(filename):
+    return send_from_directory(ASSETS_DIR, filename)
 
 
 @app.route("/api/state")
@@ -199,6 +245,130 @@ def reject():
     with open(APPROVAL_FILE, "w") as f:
         f.write("n")
     return jsonify({"status": "rejected"})
+
+
+# ── Chat endpoint ───────────────────────────────────────────────────────────────
+
+def _build_nl_system() -> str:
+    """Build the chat system prompt, injecting live agent context from resolve.log."""
+    # Read last few resolve.log entries so chat knows what the agent already did
+    agent_ctx = ""
+    try:
+        entries = _read_resolve_log()
+        # Summarise the last investigation: what tools ran, what conclusion was reached
+        tools_used = [e.get("tool","") for e in entries if e.get("event") == "tool_call"]
+        remediations = [e for e in entries if e.get("event") == "remediation_executed"]
+        conclusion = next((e.get("text","") for e in reversed(entries)
+                           if e.get("event") == "reasoning" and len(e.get("text","")) > 80), "")
+        chaos = _read_chaos()
+        lines = [f"CURRENT FAULT: {chaos}"]
+        if tools_used:
+            lines.append(f"AGENT ALREADY RAN: {', '.join(dict.fromkeys(tools_used[-12:]))}")
+        if remediations:
+            acts = [r.get("action","?") for r in remediations]
+            lines.append(f"REMEDIATIONS EXECUTED: {', '.join(acts)}")
+        if conclusion:
+            lines.append(f"AGENT CONCLUSION (last reasoning): {conclusion[:300]}")
+        agent_ctx = "\n".join(lines)
+    except Exception:
+        pass
+
+    return f"""You are Resolve, an ops assistant for a production system.
+Stack: frontend:3000 → api:8000 → db:5432.
+
+IMPORTANT — current agent state:
+{agent_ctx}
+
+Rules:
+- ALWAYS use window_minutes=1 when checking error rate after a remediation — the 5-min window
+  contains pre-fix errors and will show false positives. Only use window_minutes=5 for historical context.
+- If the agent has already executed a remediation, say so and check the 1-min window to confirm recovery.
+- Do NOT recommend actions the agent already took unless the operator explicitly asks to retry.
+- Be concise and direct — no markdown tables for simple status updates.
+
+Common queries:
+- "give me updates" / "what's wrong?" → check current fault + get_error_rate(window=1) + summarise what agent did
+- "show me the logs" → read_logs
+- "is it fixed?" → get_error_rate with window_minutes=1
+- "what happened?" → summarise agent_ctx above, call search_past_incidents if needed
+- "rollback / restart <service>" → execute_remediation"""
+
+
+def _run_chat(message: str) -> dict:
+    """Run one NL chat turn against the full tool set."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agent", ".env"))
+        from model_client import ModelClient
+        from tools import TOOL_SCHEMAS, dispatch
+    except Exception as e:
+        return {"reply": f"[chat unavailable: {e}]", "tool_calls": []}
+
+    client = ModelClient()
+    system = _build_nl_system()
+    messages = [{"role": "user", "content": message}]
+    tool_calls_made = []
+    reply = ""
+
+    for _ in range(6):
+        try:
+            response = client.chat(system, messages, TOOL_SCHEMAS)
+        except Exception as e:
+            return {"reply": f"[API error: {e}]", "tool_calls": tool_calls_made}
+
+        if response.stop_reason == "end_turn":
+            for block in response.content:
+                if block.type == "text":
+                    reply = block.text
+            break
+
+        if response.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                tool_calls_made.append({"name": block.name, "inputs": block.input})
+                result = dispatch(block.name, block.input)
+                tool_results.append({
+                    "type":        "tool_result",
+                    "tool_use_id": block.id,
+                    "content":     result,
+                })
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            break
+
+    return {"reply": reply or "[no response]", "tool_calls": tool_calls_made}
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    """
+    Natural language ops interface.
+    Body: {"message": "what's wrong with the api?"}
+    Returns: {"reply": "...", "tool_calls": [...]}
+    """
+    body    = request.get_json(silent=True) or {}
+    message = body.get("message", "").strip()
+    if not message:
+        return jsonify({"error": "message required"}), 400
+
+    # Shortcut: plain approve/reject without hitting the LLM
+    lower = message.lower()
+    if lower in ("approve", "yes", "y", "approve remediation"):
+        os.makedirs(os.path.dirname(APPROVAL_FILE), exist_ok=True)
+        with open(APPROVAL_FILE, "w") as f:
+            f.write("y")
+        return jsonify({"reply": "Remediation approved.", "tool_calls": []})
+    if lower in ("reject", "no", "n", "reject remediation", "deny"):
+        os.makedirs(os.path.dirname(APPROVAL_FILE), exist_ok=True)
+        with open(APPROVAL_FILE, "w") as f:
+            f.write("n")
+        return jsonify({"reply": "Remediation rejected.", "tool_calls": []})
+
+    result = _run_chat(message)
+    return jsonify(result)
 
 
 if __name__ == "__main__":

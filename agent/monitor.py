@@ -1,9 +1,13 @@
 """
-monitor.py — continuous anomaly detection
+monitor.py — continuous anomaly detection + proactive prevention
 
 Polls the service logs every POLL_INTERVAL seconds.
 When thresholds are breached it returns a list of anomaly dicts,
 each with id, description, severity, service, metric, and value.
+
+Proactive prevention: tracks a sliding window of metric readings and
+emits early warnings when metrics are trending toward a threshold —
+before an incident actually fires.
 
 Thresholds (tunable via env vars):
   ERROR_RATE_THRESHOLD   default 15%   — % of requests returning 4xx/5xx
@@ -42,6 +46,14 @@ LATENCY_THRESHOLD_MS   = float(os.getenv("LATENCY_THRESHOLD_MS",   "1500"))
 POLL_INTERVAL          = float(os.getenv("POLL_INTERVAL",          "5"))
 WINDOW_MINUTES         = 1   # look at last minute for rate calculations
 
+# Proactive prevention: sliding window of recent readings per service
+TREND_WINDOW     = 4      # consecutive readings to confirm a trend
+TREND_WARN_RATIO = 0.5    # warn when metric is at 50%+ of threshold and rising
+_metric_history: dict[str, list] = {
+    "api":      [],   # list of {"error_rate": float, "p95": float}
+    "frontend": [],
+}
+
 
 def _parse(result: str) -> dict:
     try:
@@ -59,6 +71,109 @@ def _biz(service: str, endpoint: str | None = None) -> tuple[str, str]:
     return p["priority"], p["reason"]
 
 
+# ML predictor snapshots queued between check_once() and check_ml_predictions()
+_ml_pending: dict[str, tuple] = {}
+
+
+def _ml_snapshot(service: str, error_rate: float, p95: float, memory: float) -> None:
+    """Feed a new reading into the ML predictor (silent — never raises)."""
+    try:
+        _ml_pending[service] = (error_rate, p95, memory)
+    except Exception:
+        pass
+
+
+def check_ml_predictions() -> str | None:
+    """
+    Run the IsolationForest predictor on the latest snapshots.
+    Returns a warning string if any service looks anomalous, else None.
+    Called every poll cycle alongside check_trends() — never triggers an incident.
+    """
+    try:
+        from predictor import predict, format_warning  # noqa
+    except ImportError:
+        return None
+
+    warnings = []
+    for service, (err, p95, mem) in list(_ml_pending.items()):
+        pred = predict(service, err, p95, mem)
+        if pred:
+            warnings.append(format_warning(pred))
+
+    if not warnings:
+        return None
+
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    return f"[{ts}] ML prediction — anomalous pattern detected:\n" + "\n".join(warnings)
+
+
+def _record_metrics(service: str, error_rate: float, p95: float) -> None:
+    """Append latest reading to the sliding window (keep last TREND_WINDOW+1)."""
+    history = _metric_history[service]
+    history.append({"error_rate": error_rate, "p95": p95})
+    if len(history) > TREND_WINDOW + 1:
+        history.pop(0)
+
+
+def _is_trending_up(values: list[float]) -> bool:
+    """Return True if values are strictly increasing."""
+    return len(values) >= TREND_WINDOW and all(
+        values[i] < values[i + 1] for i in range(len(values) - 1)
+    )
+
+
+def check_trends() -> str | None:
+    """
+    Scan metric history for deteriorating trends that haven't yet hit thresholds.
+    Returns a warning string if a trend is detected, else None.
+    Called every poll cycle alongside check_once().
+    """
+    warnings = []
+
+    for service in ("api", "frontend"):
+        history = _metric_history[service]
+        if len(history) < TREND_WINDOW:
+            continue
+
+        recent_err = [h["error_rate"] for h in history[-TREND_WINDOW:]]
+        recent_p95 = [h["p95"]        for h in history[-TREND_WINDOW:]]
+        current_err = recent_err[-1]
+        current_p95 = recent_p95[-1]
+
+        # Error rate: trending up AND above 50% of threshold but below it
+        warn_err_floor = ERROR_RATE_THRESHOLD * TREND_WARN_RATIO
+        if (_is_trending_up(recent_err)
+                and warn_err_floor <= current_err < ERROR_RATE_THRESHOLD):
+            delta = current_err - recent_err[0]
+            eta = ((ERROR_RATE_THRESHOLD - current_err) / delta * POLL_INTERVAL / 60
+                   if delta > 0 else None)
+            msg = (f"error rate on {service} trending up "
+                   f"({recent_err[0]:.1f}% → {current_err:.1f}%)")
+            if eta:
+                msg += f", ~{eta:.1f}m to threshold"
+            warnings.append(msg)
+
+        # Latency: trending up AND above 50% of threshold but below it
+        warn_lat_floor = LATENCY_THRESHOLD_MS * TREND_WARN_RATIO
+        if (_is_trending_up(recent_p95)
+                and warn_lat_floor <= current_p95 < LATENCY_THRESHOLD_MS):
+            delta = current_p95 - recent_p95[0]
+            eta = ((LATENCY_THRESHOLD_MS - current_p95) / delta * POLL_INTERVAL / 60
+                   if delta > 0 else None)
+            msg = (f"p95 latency on {service} trending up "
+                   f"({recent_p95[0]:.0f}ms → {current_p95:.0f}ms)")
+            if eta:
+                msg += f", ~{eta:.1f}m to threshold"
+            warnings.append(msg)
+
+    if not warnings:
+        return None
+
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    summary = "\n".join(f"  ⚠ {w}" for w in warnings)
+    return f"[{ts}] Proactive warning — deteriorating trend detected:\n{summary}"
+
+
 def check_once() -> list[dict] | None:
     """
     Run one anomaly-detection pass across all services.
@@ -71,6 +186,7 @@ def check_once() -> list[dict] | None:
 
     Endpoint-level anomalies are reported separately when per-endpoint breakdown
     shows divergent failure rates across endpoints on the same service.
+    Also records metrics into the sliding window for trend/ML detection.
     """
     anomalies: list[dict] = []
 
@@ -79,6 +195,8 @@ def check_once() -> list[dict] | None:
 
         # ── per-endpoint error rates (api only — api has meaningful endpoints) ──
         ep_anomalies_added: set[str] = set()
+        ep_rates: dict[str, float] = {}
+        _svc_rate = 0.0  # aggregate error rate for trend/ML recording
         if service == "api":
             ep_data = _parse(get_endpoint_error_rates(service, WINDOW_MINUTES))
             endpoints = ep_data.get("endpoints", {})
@@ -125,6 +243,7 @@ def check_once() -> list[dict] | None:
         if not ep_anomalies_added and not any_ep_above_threshold:
             er    = _parse(get_error_rate(service, WINDOW_MINUTES))
             rate  = er.get("error_rate_pct", 0)
+            _svc_rate = rate
             if rate >= ERROR_RATE_THRESHOLD:
                 total  = er.get("total_requests", "?")
                 errors = er.get("errors", "?")
@@ -183,6 +302,11 @@ def check_once() -> list[dict] | None:
                 "business_reason":   svc_biz_reason,
             })
 
+        # Record for trend/ML — only when healthy to avoid polluting baselines
+        if _svc_rate < ERROR_RATE_THRESHOLD and p95 < LATENCY_THRESHOLD_MS:
+            _record_metrics(service, _svc_rate, p95)
+            _ml_snapshot(service, _svc_rate, p95, last)
+
     return anomalies if anomalies else None
 
 
@@ -205,9 +329,11 @@ def _build_anomaly_string(anomalies: list[dict]) -> str:
 COLLECTION_WINDOW_SECS = 10.0
 
 
-def run(on_anomaly, poll_interval: float = POLL_INTERVAL):
+def run(on_anomaly, poll_interval: float = POLL_INTERVAL,
+        on_warning=None):
     """
     Poll continuously.  Calls on_anomaly(description) when something is wrong.
+    Calls on_warning(description) for proactive trend warnings (optional).
     Will not re-trigger for the same incident until the system recovers
     (anomalies drop back to None).
 
@@ -225,6 +351,7 @@ def run(on_anomaly, poll_interval: float = POLL_INTERVAL):
         f"  Thresholds: error_rate>{ERROR_RATE_THRESHOLD}%  "
         f"p95>{LATENCY_THRESHOLD_MS}ms  "
         f"memory_delta>{MEMORY_DELTA_THRESHOLD}MB\n"
+        f"  Proactive prevention: watching for trends (window={TREND_WINDOW} readings)\n"
     )
 
     incident_active    = False
@@ -292,12 +419,33 @@ def run(on_anomaly, poll_interval: float = POLL_INTERVAL):
             # 30-second grace period: stale errors may still be in the sliding
             # window even though the system has actually recovered.
             recovery_until  = time.time() + 30
+            # Clear rule-based history and ML predictor after recovery
+            for svc in _metric_history:
+                _metric_history[svc].clear()
+            try:
+                from predictor import reset as ml_reset
+                ml_reset()
+            except Exception:
+                pass
             console.print(
                 "\n  [bold green]✓ System recovered — 30s grace period before "
                 "re-arming monitor[/bold green]\n"
             )
 
         elif not anomalies:
+            # Rule-based trend check
+            warning = check_trends()
+            if warning:
+                console.print(f"\n  [bold yellow]{warning}[/bold yellow]\n")
+                if on_warning:
+                    on_warning(warning)
+
+            # ML-based prediction check
+            ml_warning = check_ml_predictions()
+            if ml_warning:
+                console.print(f"\n  [bold magenta]{ml_warning}[/bold magenta]\n")
+                if on_warning:
+                    on_warning(ml_warning)
             now = datetime.now().strftime("%H:%M:%S")
             if in_grace:
                 remaining = int(recovery_until - time.time())
