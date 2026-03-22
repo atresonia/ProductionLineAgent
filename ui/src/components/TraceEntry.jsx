@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import ReactMarkdown from 'react-markdown'
 import {
   AlertCircle, FileText, Wrench, Database, Image,
   Brain, Zap, CheckCircle2, XCircle, FileCheck, ChevronDown, ChevronUp,
@@ -65,54 +66,28 @@ function JsonPreview({ data, maxLen = 140 }) {
   )
 }
 
-// ── Simple markdown renderer (bold, headers, lists, tables) ──────────────────
+// ── Shared ReactMarkdown component maps ──────────────────────────────────────
 
-function renderSimpleMarkdown(text) {
-  if (!text) return null
-  return text.split('\n').map((line, i) => {
-    // Table separator rows — skip entirely
-    if (/^\|[\s\-:|]+\|/.test(line)) return null
-    // Table data rows — render as spaced columns
-    if (/^\|.+\|/.test(line)) {
-      const cells = line.split('|').map(c => c.trim()).filter(Boolean)
-      return (
-        <div key={i} className="flex gap-4">
-          {cells.map((c, j) => (
-            <span key={j} className="flex-1" dangerouslySetInnerHTML={{
-              __html: c.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-            }} />
-          ))}
-        </div>
-      )
-    }
-    // ## headers
-    if (/^## (.+)/.test(line)) {
-      return (
-        <div key={i} className="font-semibold text-r-text/80 mt-1.5 mb-0.5 not-italic">
-          {line.slice(3)}
-        </div>
-      )
-    }
-    // Bullet list items
-    if (/^[-*] (.+)/.test(line)) {
-      return (
-        <div key={i} className="flex gap-1.5 ml-2">
-          <span className="text-r-dim flex-shrink-0">•</span>
-          <span dangerouslySetInnerHTML={{
-            __html: line.slice(2).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-          }} />
-        </div>
-      )
-    }
-    // Blank line
-    if (!line.trim()) return <br key={i} />
-    // Regular line with bold support
-    return (
-      <span key={i} dangerouslySetInnerHTML={{
-        __html: line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      }} />
-    )
-  }).filter(Boolean)
+const reasoningMdComponents = {
+  h2: ({ children }) => (
+    <div className="font-semibold text-r-text/80 text-[12px] mt-2 mb-0.5 not-italic">{children}</div>
+  ),
+  h3: ({ children }) => (
+    <div className="font-semibold text-r-text/70 mt-1 mb-0.5 not-italic">{children}</div>
+  ),
+  hr: () => <hr className="border-0 border-t border-r-border/40 my-1.5" />,
+  code: ({ children }) => (
+    <code className="font-mono bg-white/[.08] px-1 py-px rounded text-[10px] not-italic">{children}</code>
+  ),
+  ul: ({ children }) => <ul className="flex flex-col gap-0.5 ml-1">{children}</ul>,
+  li: ({ children }) => (
+    <div className="flex gap-1.5 ml-2">
+      <span className="text-r-dim flex-shrink-0">•</span>
+      <span>{children}</span>
+    </div>
+  ),
+  p: ({ children }) => <span>{children}</span>,
+  strong: ({ children }) => <strong className="font-semibold text-r-text/80">{children}</strong>,
 }
 
 // ── Entry types ───────────────────────────────────────────────────────────────
@@ -211,7 +186,7 @@ function ReasoningEntry({ entry }) {
           <Ts ts={entry.ts} />
         </div>
         <div className="font-mono text-[11px] text-r-text/60 italic leading-relaxed flex flex-col gap-0.5">
-          {renderSimpleMarkdown(entry.text)}
+          <ReactMarkdown components={reasoningMdComponents}>{entry.text || ''}</ReactMarkdown>
         </div>
       </div>
     </Card>
@@ -339,26 +314,6 @@ function RemediationResultEntry({ entry }) {
 function PostmortemEntry({ entry }) {
   const [expanded, setExpanded] = useState(false)
 
-  const renderMarkdown = (md) =>
-    md.split('\n').map((line, i) => {
-      if (/^# (.+)/.test(line))  return <h1 key={i}>{line.slice(2)}</h1>
-      if (/^## (.+)/.test(line)) return <h2 key={i}>{line.slice(3)}</h2>
-      if (/^\| /.test(line)) {
-        if (/^[\| \-:]+$/.test(line.replace(/\|/g, '').trim())) return null
-        const cells = line.split('|').filter(c => c.trim())
-        const isHeader = md.split('\n')[i + 1]?.includes('---')
-        return <tr key={i}>{cells.map((c, j) =>
-          isHeader ? <th key={j}>{c.trim()}</th> : <td key={j}>{c.trim()}</td>
-        )}</tr>
-      }
-      if (/^[-*] (.+)/.test(line)) return <li key={i}>{line.slice(2)}</li>
-      if (/^---$/.test(line))      return <hr key={i} />
-      if (line.trim() === '')      return <br key={i} />
-      return <p key={i} dangerouslySetInnerHTML={{
-        __html: line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      }} />
-    }).filter(Boolean)
-
   return (
     <Card accent="cyan">
       <FileCheck size={14} className="text-r-cyan flex-shrink-0 mt-0.5" />
@@ -382,7 +337,7 @@ function PostmortemEntry({ entry }) {
         </button>
         {expanded && (
           <div className="pm-content border border-r-border rounded p-3 bg-r-panel">
-            {renderMarkdown(entry.markdown || '')}
+            <ReactMarkdown>{entry.markdown || ''}</ReactMarkdown>
           </div>
         )}
       </div>

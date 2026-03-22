@@ -1,5 +1,30 @@
 import { useEffect, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { Hash } from 'lucide-react'
+
+const slackMdComponents = {
+  h2: ({ children }) => (
+    <div className="font-mono text-[11px] font-semibold text-r-text mb-0.5">{children}</div>
+  ),
+  h3: ({ children }) => (
+    <div className="font-mono text-[11px] font-semibold text-r-text/80 mb-0.5">{children}</div>
+  ),
+  p: ({ children }) => (
+    <div className="font-mono text-[10px] text-r-dim leading-relaxed">{children}</div>
+  ),
+  strong: ({ children }) => <span className="font-semibold text-r-text">{children}</span>,
+  code: ({ children }) => (
+    <code className="font-mono bg-white/[.08] px-1 py-px rounded text-[10px]">{children}</code>
+  ),
+  ul: ({ children }) => <ul className="ml-3 flex flex-col gap-0.5">{children}</ul>,
+  li: ({ children }) => (
+    <div className="flex gap-1.5">
+      <span className="text-r-dim flex-shrink-0">•</span>
+      <span className="font-mono text-[10px] text-r-dim">{children}</span>
+    </div>
+  ),
+  hr: () => <hr className="border-0 border-t border-r-border/40 my-1" />,
+}
 
 const RESOLVE_AVATAR = (
   <div className="w-7 h-7 rounded flex items-center justify-center flex-shrink-0
@@ -34,9 +59,6 @@ const SEVERITY_STYLES = {
 function SlackMessage({ msg }) {
   const sev = SEVERITY_STYLES[msg.severity] || SEVERITY_STYLES.info
 
-  // Parse the message into attachment-style blocks
-  const lines = (msg.message || '').split('\n')
-
   return (
     <div className="flex gap-2 p-3 hover:bg-r-raised/50 transition-colors group">
       {RESOLVE_AVATAR}
@@ -60,22 +82,7 @@ function SlackMessage({ msg }) {
             </div>
 
             {/* Message lines */}
-            {lines.map((line, i) => {
-              if (!line.trim()) return null
-              // Bold headers (lines with * or all-caps short lines)
-              if (line.startsWith('*') || /^\*\*.+\*\*$/.test(line.trim())) {
-                return (
-                  <div key={i} className="font-mono text-[11px] font-semibold text-r-text mb-0.5">
-                    {line.replace(/\*\*/g, '')}
-                  </div>
-                )
-              }
-              return (
-                <div key={i} className="font-mono text-[10px] text-r-dim leading-relaxed">
-                  {line}
-                </div>
-              )
-            })}
+            <ReactMarkdown components={slackMdComponents}>{msg.message || ''}</ReactMarkdown>
           </div>
         </div>
       </div>
