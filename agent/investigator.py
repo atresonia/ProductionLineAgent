@@ -27,6 +27,12 @@ console = Console()
 LOG_DIR         = os.getenv("LOG_DIR", "./logs")
 RESOLVE_LOG     = os.path.join(LOG_DIR, "resolve.log")
 
+# ── WebSocket callback hooks — set by server.py before calling investigate() ──
+# _event_callback(dict): called for every logged event (thread-safe)
+# _approval_callback(action, service, reason) -> bool: replaces terminal input()
+_event_callback:    "callable | None" = None
+_approval_callback: "callable | None" = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # System prompt: two-phase protocol — PLAN first, then INVESTIGATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,6 +67,11 @@ def _ilog(entry: dict):
     entry["service"]   = "resolve"
     with open(RESOLVE_LOG, "a") as f:
         f.write(json.dumps(entry) + "\n")
+    if _event_callback:
+        try:
+            _event_callback(dict(entry))
+        except Exception:
+            pass
 
 
 def _print_tool_call(name: str, inputs: dict):
@@ -180,16 +191,23 @@ def investigate(anomaly: str,
                 if block.name == "execute_remediation" and require_approval:
                     action  = block.input.get("action", "unknown")
                     service = block.input.get("service", "api")
-                    console.print()
-                    console.print(Panel(
-                        f"[bold yellow]REMEDIATION REQUEST[/bold yellow]\n\n"
-                        f"Action  : [cyan]{action}[/cyan]\n"
-                        f"Service : [cyan]{service}[/cyan]\n\n"
-                        f"Approve? [y/N]",
-                        border_style="yellow",
-                    ))
-                    answer = input("  > ").strip().lower()
-                    if answer not in ("y", "yes"):
+                    reason  = block.input.get("reason", "")
+
+                    if _approval_callback:
+                        approved = _approval_callback(action, service, reason)
+                    else:
+                        console.print()
+                        console.print(Panel(
+                            f"[bold yellow]REMEDIATION REQUEST[/bold yellow]\n\n"
+                            f"Action  : [cyan]{action}[/cyan]\n"
+                            f"Service : [cyan]{service}[/cyan]\n\n"
+                            f"Approve? [y/N]",
+                            border_style="yellow",
+                        ))
+                        answer = input("  > ").strip().lower()
+                        approved = answer in ("y", "yes")
+
+                    if not approved:
                         result = '{"status": "rejected", "reason": "operator declined"}'
                         _ilog({"event": "remediation_rejected", "action": action})
                         console.print("  [red]Remediation rejected.[/red]")

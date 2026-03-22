@@ -22,7 +22,7 @@ ERROR_RATE_THRESHOLD   = float(os.getenv("ERROR_RATE_THRESHOLD",   "15"))
 MEMORY_DELTA_THRESHOLD = float(os.getenv("MEMORY_DELTA_THRESHOLD", "80"))
 LATENCY_THRESHOLD_MS   = float(os.getenv("LATENCY_THRESHOLD_MS",   "1500"))
 POLL_INTERVAL          = float(os.getenv("POLL_INTERVAL",          "5"))
-WINDOW_MINUTES         = 3   # look at last 3 minutes for rate calculations
+WINDOW_MINUTES         = 1   # look at last 3 minutes for rate calculations
 
 
 def _parse(result: str) -> dict:

@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Resolve — Incident Commander</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ── Reset ───────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:             #08080e;
+  --surface:        #0f0f17;
+  --surface-raised: #161622;
+  --surface-active: #1c1c2c;
+  --border:         #1e1e2e;
+  --border-muted:   #171724;
+  --border-active:  #2e2e48;
+
+  --text:           #d0d0e4;
+  --text-dim:       #5c5c80;
+  --text-muted:     #2c2c44;
+
+  --cyan:           #00cfff;
+  --cyan-soft:      #0099cc;
+  --cyan-bg:        rgba(0, 207, 255, 0.05);
+  --cyan-border:    rgba(0, 207, 255, 0.14);
+
+  --red:            #ff3d55;
+  --red-soft:       #cc2240;
+  --red-bg:         rgba(255, 61, 85, 0.07);
+  --red-border:     rgba(255, 61, 85, 0.18);
+
+  --amber:          #ffaa00;
+  --amber-bg:       rgba(255, 170, 0, 0.07);
+  --amber-border:   rgba(255, 170, 0, 0.18);
+
+  --green:          #00cc66;
+  --green-bg:       rgba(0, 204, 102, 0.07);
+  --green-border:   rgba(0, 204, 102, 0.18);
+
+  --font-mono:  'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --font-ui:    'Inter', system-ui, sans-serif;
+
+  --r:  5px;
+  --r2: 3px;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── App shell ───────────────────────────────────────────────────────── */
+.app {
+  display: grid;
+  grid-template-rows: 44px 1fr;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────── */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+
+.logo {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--cyan);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding-right: 16px;
+}
+
+.vsep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 16px;
+  flex-shrink: 0;
+}
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+}
+.dot.crit {
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red);
+  animation: blink 1.4s ease-in-out infinite;
+}
+.dot.warn { background: var(--amber); }
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.35; }
+}
+
+.status-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+
+.fault-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--r2);
+  background: var(--red-bg);
+  border: 1px solid var(--red-border);
+  color: var(--red);
+  letter-spacing: 0.04em;
+}
+.fault-chip.none {
+  background: var(--green-bg);
+  border-color: var(--green-border);
+  color: var(--green);
+}
+
+.header-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.clock {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mttr-pill {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--cyan);
+  background: var(--cyan-bg);
+  border: 1px solid var(--cyan-border);
+  border-radius: var(--r2);
+  padding: 2px 8px;
+}
+
+/* ── Main grid ───────────────────────────────────────────────────────── */
+.main {
+  display: grid;
+  grid-template-columns: 1fr 296px;
+  overflow: hidden;
+}
+
+/* ── Left column ─────────────────────────────────────────────────────── */
+.left-col {
+  display: grid;
+  grid-template-rows: 1fr;
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+/* ── Panel ───────────────────────────────────────────────────────────── */
+.panel {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  min-height: 0;
+}
+
+.panel-hd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--border-muted);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+
+.panel-title {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.panel-meta {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.count-badge {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: var(--r2);
+  background: var(--cyan-bg);
+  border: 1px solid var(--cyan-border);
+  color: var(--cyan);
+}
+
+.panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 14px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-active) transparent;
+}
+
+/* ── Feed ────────────────────────────────────────────────────────────── */
+#feed {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 7px;
+  border-radius: var(--r2);
+  transition: background 0.1s;
+}
+.step:hover { background: var(--surface-raised); }
+
+.step-ic {
+  flex-shrink: 0;
+  width: 16px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-top: 1px;
+  text-align: center;
+}
+
+.step-body  { flex: 1; min-width: 0; }
+
+.step-tag {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  line-height: 1.2;
+  margin-bottom: 1px;
+}
+
+.step-msg {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.step-sub {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 1px;
+  word-break: break-word;
+}
+
+.step-ts {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* Step variants */
+.s-start  .step-ic, .s-start  .step-tag { color: var(--cyan); }
+.s-start  { border-left: 2px solid var(--cyan-border); padding-left: 6px; }
+
+.s-think  .step-ic, .s-think  .step-tag { color: var(--text-dim); }
+
+.s-tool   .step-ic, .s-tool   .step-tag { color: var(--amber); }
+
+.s-result .step-ic, .s-result .step-tag { color: var(--green); }
+.s-result { background: var(--green-bg); }
+.s-result:hover { background: rgba(0,204,102,0.1); }
+
+.s-rootcause .step-ic, .s-rootcause .step-tag { color: var(--red); }
+.s-rootcause {
+  background: var(--red-bg);
+  border-left: 2px solid var(--red-border);
+  padding-left: 6px;
+}
+.s-rootcause:hover { background: rgba(255,61,85,0.1); }
+
+.s-end .step-ic, .s-end .step-tag { color: var(--cyan); }
+.s-end {
+  background: var(--cyan-bg);
+  border-left: 2px solid var(--cyan-border);
+  padding-left: 6px;
+}
+
+/* Empty state */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 6px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: center;
+}
+.empty-icon {
+  font-size: 28px;
+  margin-bottom: 4px;
+  opacity: 0.25;
+}
+
+/* ── Remediation gate ────────────────────────────────────────────────── */
+#remediation-gate {
+  background: var(--surface);
+  border-top: 1px solid var(--border-active);
+  flex-shrink: 0;
+}
+
+.rem-body {
+  padding: 12px 16px;
+}
+
+.rem-desc {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.rem-actions { display: flex; gap: 8px; }
+
+.btn {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 6px 18px;
+  border-radius: var(--r2);
+  border: 1px solid;
+  cursor: pointer;
+  transition: all 0.12s;
+  background: transparent;
+}
+
+.btn-approve {
+  color: var(--green);
+  border-color: var(--green-border);
+  background: var(--green-bg);
+}
+.btn-approve:hover {
+  background: rgba(0,204,102,0.14);
+  border-color: var(--green);
+}
+
+.btn-reject {
+  color: var(--red);
+  border-color: var(--red-border);
+  background: var(--red-bg);
+}
+.btn-reject:hover {
+  background: rgba(255,61,85,0.14);
+  border-color: var(--red);
+}
+
+/* ── Right sidebar ───────────────────────────────────────────────────── */
+.right-col {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-active) transparent;
+}
+
+/* ── Timer ───────────────────────────────────────────────────────────── */
+.timer-num {
+  font-family: var(--font-mono);
+  font-size: 32px;
+  font-weight: 600;
+  padding: 12px 16px 2px;
+  line-height: 1;
+  color: var(--red);
+  letter-spacing: -0.01em;
+}
+.timer-num.ok { color: var(--text-muted); }
+
+.timer-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0 16px 12px;
+}
+
+/* ── Chaos ───────────────────────────────────────────────────────────── */
+.chaos-body {
+  padding: 10px 14px 14px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.fault-tag {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: var(--r2);
+  border: 1px solid;
+}
+.fault-tag.none  { color: var(--green); background: var(--green-bg); border-color: var(--green-border); }
+.fault-tag.alert { color: var(--red);   background: var(--red-bg);   border-color: var(--red-border);   }
+
+/* ── Metrics ─────────────────────────────────────────────────────────── */
+.metric-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 10px 14px;
+}
+
+.metric-card {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 9px 11px;
+}
+
+.mc-service {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 7px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.mc-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-top: 3px;
+}
+.mc-key { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); }
+.mc-val { font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
+.mc-val.ok   { color: var(--green); }
+.mc-val.warn { color: var(--amber); }
+.mc-val.crit { color: var(--red); }
+
+/* ── Service health ──────────────────────────────────────────────────── */
+.health-list {
+  padding: 8px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.health-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--r2);
+}
+
+.h-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.h-status {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.h-status.healthy  { color: var(--green); }
+.h-status.degraded { color: var(--red); }
+.h-status.warning  { color: var(--amber); }
+.h-status.unknown  { color: var(--text-muted); }
+
+/* ── Scrollbars ──────────────────────────────────────────────────────── */
+::-webkit-scrollbar         { width: 3px; }
+::-webkit-scrollbar-track   { background: transparent; }
+::-webkit-scrollbar-thumb   { background: var(--border-active); border-radius: 2px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ── Header ──────────────────────────────────────────────────────── -->
+  <header class="header">
+    <span class="logo">Resolve</span>
+    <div class="vsep"></div>
+    <div class="header-status">
+      <div class="dot" id="hdr-dot"></div>
+      <span class="status-text" id="hdr-status">ALL SYSTEMS HEALTHY</span>
+      <div class="vsep"></div>
+      <span class="fault-chip none" id="hdr-fault">none</span>
+    </div>
+    <div class="header-right">
+      <span class="clock" id="clock"></span>
+    </div>
+  </header>
+
+  <!-- ── Main ────────────────────────────────────────────────────────── -->
+  <div class="main">
+
+    <!-- Left: reasoning feed + remediation gate -->
+    <div class="left-col">
+
+      <!-- Reasoning feed fills all available space -->
+      <div class="panel" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+        <div class="panel-hd">
+          <span class="panel-title">Agent Reasoning</span>
+          <span class="count-badge" id="step-count">0 steps</span>
+          <span class="panel-meta" id="phase-label"></span>
+        </div>
+        <div class="panel-body" id="feed-container">
+          <div id="feed">
+            <div class="empty">
+              <div class="empty-icon">◎</div>
+              <div>Monitoring — no active incident</div>
+              <div style="color:var(--text-muted);font-size:10px;margin-top:3px">Agent reasoning will stream here when triggered</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Remediation gate — hidden until needed -->
+        <div id="remediation-gate" style="display:none;">
+          <div class="panel-hd" style="background:var(--red-bg);border-color:var(--red-border);">
+            <div class="dot crit"></div>
+            <span class="panel-title" style="color:var(--red);">Remediation Pending — Awaiting Approval</span>
+          </div>
+          <div class="rem-body">
+            <div class="rem-desc" id="rem-desc">—</div>
+            <div class="rem-actions">
+              <button class="btn btn-approve" onclick="decide('approve')">APPROVE</button>
+              <button class="btn btn-reject"  onclick="decide('reject')">REJECT</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Right sidebar -->
+    <div class="right-col">
+
+      <!-- Incident timer -->
+      <div class="panel">
+        <div class="panel-hd"><span class="panel-title">Incident Duration</span></div>
+        <div class="timer-num ok" id="timer">—</div>
+        <div class="timer-label" id="timer-lbl">no active incident</div>
+      </div>
+
+      <!-- Chaos state -->
+      <div class="panel">
+        <div class="panel-hd"><span class="panel-title">Chaos State</span></div>
+        <div class="chaos-body">
+          <span class="fault-tag none" id="fault-tag">none</span>
+        </div>
+      </div>
+
+      <!-- Service metrics -->
+      <div class="panel">
+        <div class="panel-hd">
+          <span class="panel-title">Service Metrics</span>
+          <span class="panel-meta">3 min window</span>
+        </div>
+        <div class="metric-grid">
+          <div class="metric-card">
+            <div class="mc-service"><div class="dot" id="dot-api"></div>api</div>
+            <div class="mc-row"><span class="mc-key">errors</span><span class="mc-val ok" id="api-err">—</span></div>
+            <div class="mc-row"><span class="mc-key">p95</span>   <span class="mc-val ok" id="api-p95">—</span></div>
+            <div class="mc-row"><span class="mc-key">mem</span>   <span class="mc-val ok" id="api-mem">—</span></div>
+          </div>
+          <div class="metric-card">
+            <div class="mc-service"><div class="dot" id="dot-fe"></div>frontend</div>
+            <div class="mc-row"><span class="mc-key">errors</span><span class="mc-val ok" id="fe-err">—</span></div>
+            <div class="mc-row"><span class="mc-key">p95</span>   <span class="mc-val ok" id="fe-p95">—</span></div>
+            <div class="mc-row"><span class="mc-key">mem</span>   <span class="mc-val ok" id="fe-mem">—</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Service health -->
+      <div class="panel">
+        <div class="panel-hd"><span class="panel-title">Service Health</span></div>
+        <div class="health-list" id="health-list">
+          <div class="health-row"><div class="h-name"><div class="dot"></div>api</div>     <span class="h-status unknown">—</span></div>
+          <div class="health-row"><div class="h-name"><div class="dot"></div>frontend</div><span class="h-status unknown">—</span></div>
+          <div class="health-row"><div class="h-name"><div class="dot"></div>db</div>      <span class="h-status unknown">—</span></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+/* ── State ──────────────────────────────────────────────────────────── */
+let _incidentStart = null;
+let _timerHandle  = null;
+let _lastStepCount = 0;
+
+/* ── Utils ──────────────────────────────────────────────────────────── */
+const $ = id => document.getElementById(id);
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function statusClass(v, warn, crit) {
+  if (v >= crit) return 'crit';
+  if (v >= warn) return 'warn';
+  return 'ok';
+}
+
+function dotCls(status) {
+  if (status === 'degraded') return 'crit';
+  if (status === 'warning')  return 'warn';
+  return '';
+}
+
+function elapsed(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  const s  = Math.floor(ms / 1000);
+  const m  = Math.floor(s / 60);
+  const h  = Math.floor(m / 60);
+  if (h > 0)  return `${h}h ${m % 60}m`;
+  if (m > 0)  return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+function tickTimer() {
+  if (_incidentStart) {
+    $('timer').textContent = elapsed(_incidentStart);
+  }
+}
+
+/* ── Step rendering ─────────────────────────────────────────────────── */
+function stepMeta(e) {
+  const ev = e.event || e.type || '';
+  switch (ev) {
+    case 'investigation_start':
+      return { cls: 's-start',    ic: '◎', tag: 'INVESTIGATION STARTED' };
+    case 'reasoning':
+      return { cls: 's-think',    ic: '·', tag: 'REASONING' };
+    case 'tool_call':
+      return { cls: 's-tool',     ic: '→', tag: e.tool || 'TOOL' };
+    case 'tool_result':
+      return { cls: 's-result',   ic: '✓', tag: e.tool ? `← ${e.tool}` : '← RESULT' };
+    case 'root_cause':
+      return { cls: 's-rootcause',ic: '⚑', tag: 'ROOT CAUSE IDENTIFIED' };
+    case 'conclusion': case 'end':
+      return { cls: 's-end',      ic: '◉', tag: 'CONCLUSION' };
+    default:
+      return { cls: '',           ic: '·', tag: ev.toUpperCase() || 'LOG' };
+  }
+}
+
+function renderStep(e) {
+  const { cls, ic, tag } = stepMeta(e);
+  const ts = e.timestamp
+    ? new Date(e.timestamp).toISOString().split('T')[1].slice(0, 8)
+    : '';
+
+  // Primary message
+  let msg = '';
+  if (e.event === 'investigation_start') {
+    msg = esc((e.anomaly || '').slice(0, 180));
+  } else if (e.event === 'reasoning') {
+    msg = esc((e.text || '').slice(0, 200));
+  } else if (e.event === 'tool_call') {
+    const inp = e.inputs ? JSON.stringify(e.inputs) : '';
+    msg = esc(inp.slice(0, 140));
+  } else if (e.event === 'tool_result') {
+    msg = esc((e.result_preview || '').slice(0, 160));
+  } else {
+    msg = esc(JSON.stringify(e).slice(0, 140));
+  }
+
+  return `
+    <div class="step ${cls}">
+      <div class="step-ic">${ic}</div>
+      <div class="step-body">
+        <div class="step-tag">${esc(tag)}</div>
+        <div class="step-msg">${msg}</div>
+      </div>
+      <div class="step-ts">${ts}</div>
+    </div>`;
+}
+
+/* ── Apply state ────────────────────────────────────────────────────── */
+function applyState(s) {
+  const fault    = s.fault || 'none';
+  const isActive = s.incident_active;
+
+  /* Header */
+  const hdrDot = $('hdr-dot');
+  hdrDot.className = 'dot' + (isActive ? ' crit' : '');
+  $('hdr-status').textContent = isActive ? 'INCIDENT ACTIVE' : 'ALL SYSTEMS HEALTHY';
+  const fc = $('hdr-fault');
+  fc.textContent = fault;
+  fc.className = 'fault-chip' + (fault === 'none' ? ' none' : '');
+
+  /* Fault tag */
+  const ft = $('fault-tag');
+  ft.textContent = fault;
+  ft.className = 'fault-tag ' + (fault === 'none' ? 'none' : 'alert');
+
+  /* Timer */
+  if (isActive && s.incident_start) {
+    if (_incidentStart !== s.incident_start) {
+      _incidentStart = s.incident_start;
+      if (_timerHandle) clearInterval(_timerHandle);
+      _timerHandle = setInterval(tickTimer, 1000);
+    }
+    $('timer').className = 'timer-num';
+    $('timer-lbl').textContent = 'elapsed since detection';
+    tickTimer();
+  } else {
+    _incidentStart = null;
+    if (_timerHandle) { clearInterval(_timerHandle); _timerHandle = null; }
+    $('timer').className = 'timer-num ok';
+    $('timer').textContent = '—';
+    $('timer-lbl').textContent = 'no active incident';
+  }
+
+  /* Metrics */
+  const m = s.metrics || {};
+  function applyMetrics(svc, errId, p95Id, memId, dotId) {
+    const d = m[svc] || {};
+    const err = d.error_rate_pct ?? 0;
+    const p95 = d.p95_ms ?? 0;
+    const mem = d.last_memory_mb ?? 0;
+
+    const eEl = $(errId); eEl.textContent = `${err}%`;  eEl.className = 'mc-val ' + statusClass(err, 5, 15);
+    const pEl = $(p95Id); pEl.textContent = p95 ? `${p95}ms` : '—'; pEl.className = 'mc-val ' + statusClass(p95, 500, 1500);
+    const mEl = $(memId); mEl.textContent = mem ? `${mem}MB` : '—'; mEl.className = 'mc-val ' + statusClass(mem, 300, 600);
+
+    const dEl = $(dotId);
+    dEl.className = 'dot ' + dotCls(d.status || 'unknown');
+  }
+  applyMetrics('api',      'api-err', 'api-p95', 'api-mem', 'dot-api');
+  applyMetrics('frontend', 'fe-err',  'fe-p95',  'fe-mem',  'dot-fe');
+
+  /* Service health */
+  const apiSt = m.api?.status      || 'unknown';
+  const feSt  = m.frontend?.status || 'unknown';
+  const dbSt  = fault === 'db_down' ? 'degraded'
+              : fault === 'none'    ? 'healthy'
+              : 'healthy';
+
+  $('health-list').innerHTML = [
+    { n: 'api',      st: apiSt },
+    { n: 'frontend', st: feSt  },
+    { n: 'db',       st: dbSt  },
+  ].map(h => `
+    <div class="health-row">
+      <div class="h-name"><div class="dot ${dotCls(h.st)}"></div>${h.n}</div>
+      <span class="h-status ${h.st}">${h.st.toUpperCase()}</span>
+    </div>`).join('');
+
+  /* Reasoning feed */
+  const steps = s.resolve_steps || [];
+  const feed  = $('feed');
+  if (steps.length === 0) {
+    if (_lastStepCount !== 0) {
+      feed.innerHTML = `
+        <div class="empty">
+          <div class="empty-icon">◎</div>
+          <div>Monitoring — no active incident</div>
+          <div style="color:var(--text-muted);font-size:10px;margin-top:3px">Agent reasoning will stream here when triggered</div>
+        </div>`;
+    }
+  } else {
+    feed.innerHTML = steps.map(renderStep).join('');
+    if (steps.length !== _lastStepCount) {
+      const c = $('feed-container');
+      c.scrollTop = c.scrollHeight;
+    }
+  }
+  _lastStepCount = steps.length;
+  $('step-count').textContent = `${steps.length} step${steps.length !== 1 ? 's' : ''}`;
+
+  /* Remediation gate */
+  const gate = $('remediation-gate');
+  if (s.pending_remediation) {
+    gate.style.display = '';
+    $('rem-desc').textContent = s.remediation_description || 'Awaiting approval in terminal — check agent console.';
+  } else {
+    gate.style.display = 'none';
+  }
+}
+
+/* ── Remediation decision ───────────────────────────────────────────── */
+function decide(action) {
+  fetch(`/api/${action}`, { method: 'POST' })
+    .then(r => r.json())
+    .then(() => { $('remediation-gate').style.display = 'none'; })
+    .catch(console.error);
+}
+
+/* ── Clock ──────────────────────────────────────────────────────────── */
+function updateClock() {
+  const now = new Date();
+  const hh  = String(now.getUTCHours()).padStart(2, '0');
+  const mm  = String(now.getUTCMinutes()).padStart(2, '0');
+  const ss  = String(now.getUTCSeconds()).padStart(2, '0');
+  $('clock').textContent = `${hh}:${mm}:${ss} UTC`;
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+/* ── SSE ────────────────────────────────────────────────────────────── */
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.onmessage = ev => {
+    try { applyState(JSON.parse(ev.data)); }
+    catch (e) { console.error('parse error', e); }
+  };
+  es.onerror = () => { es.close(); setTimeout(connect, 3000); };
+}
+
+/* ── Boot ───────────────────────────────────────────────────────────── */
+fetch('/api/state')
+  .then(r => r.json())
+  .then(applyState)
+  .catch(console.error);
+
+connect();
+</script>
+</body>
+</html>

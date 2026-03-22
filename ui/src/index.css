@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 13px;
+    color: #c0c0e0;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+@layer utilities {
+  .font-mono-all * { font-family: 'JetBrains Mono', monospace; }
+
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: #2a2a4a transparent;
+  }
+
+  /* Markdown post-mortem rendering */
+  .pm-content h1 { font-size: 14px; font-weight: 600; color: #c0c0e0; margin-bottom: 8px; border-bottom: 1px solid #1c1c34; padding-bottom: 6px; }
+  .pm-content h2 { font-size: 12px; font-weight: 600; color: #4a4a70; letter-spacing: 0.1em; text-transform: uppercase; margin-top: 14px; margin-bottom: 6px; }
+  .pm-content p  { font-size: 12px; color: #9090b0; line-height: 1.6; margin-bottom: 8px; }
+  .pm-content ul, .pm-content ol { padding-left: 16px; margin-bottom: 8px; }
+  .pm-content li { font-size: 12px; color: #9090b0; line-height: 1.6; margin-bottom: 2px; }
+  .pm-content table { width: 100%; border-collapse: collapse; font-size: 11px; margin-bottom: 8px; }
+  .pm-content th { text-align: left; color: #4a4a70; font-weight: 600; padding: 4px 8px; border-bottom: 1px solid #1c1c34; }
+  .pm-content td { color: #9090b0; padding: 4px 8px; border-bottom: 1px solid #12121e; }
+  .pm-content hr { border: none; border-top: 1px solid #1c1c34; margin: 12px 0; }
+  .pm-content code { font-family: 'JetBrains Mono', monospace; font-size: 11px; background: #0d0d1a; color: #00e5ff; padding: 1px 4px; border-radius: 3px; }
+  .pm-content strong { color: #c0c0e0; font-weight: 600; }
+  .pm-content em { color: #7a7a9a; font-style: italic; }
+}
