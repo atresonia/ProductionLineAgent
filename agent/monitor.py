@@ -2,27 +2,45 @@
 monitor.py — continuous anomaly detection
 
 Polls the service logs every POLL_INTERVAL seconds.
-When a threshold is breached it returns an anomaly description
-that the main agent loop passes to the investigator.
+When thresholds are breached it returns a list of anomaly dicts,
+each with id, description, severity, service, metric, and value.
 
 Thresholds (tunable via env vars):
   ERROR_RATE_THRESHOLD   default 15%   — % of requests returning 4xx/5xx
   MEMORY_DELTA_THRESHOLD default 80 MB — memory growth in last 5 minutes
   LATENCY_THRESHOLD_MS   default 1500  — p95 latency
+
+Severity rules:
+  critical : error rate > 50% on any service
+  high     : error rate > 15%, or memory delta > 80 MB
+  medium   : p95 latency > 1500ms
 """
 
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 
-from tools import get_error_rate, get_latency_stats, get_memory_trend
+from tools import get_error_rate, get_latency_stats, get_memory_trend, get_endpoint_error_rates
+
+try:
+    from config import get_endpoint_priority, get_service_priority
+    _config_available = True
+except Exception:
+    _config_available = False
+
+    def get_service_priority(service: str) -> dict:
+        return {"priority": "high", "reason": "default — no triage config loaded"}
+
+    def get_endpoint_priority(service: str, endpoint: str) -> dict:
+        return {"priority": "high", "reason": "default — no triage config loaded"}
 
 ERROR_RATE_THRESHOLD   = float(os.getenv("ERROR_RATE_THRESHOLD",   "15"))
 MEMORY_DELTA_THRESHOLD = float(os.getenv("MEMORY_DELTA_THRESHOLD", "80"))
 LATENCY_THRESHOLD_MS   = float(os.getenv("LATENCY_THRESHOLD_MS",   "1500"))
 POLL_INTERVAL          = float(os.getenv("POLL_INTERVAL",          "5"))
-WINDOW_MINUTES         = 1   # look at last 3 minutes for rate calculations
+WINDOW_MINUTES         = 1   # look at last minute for rate calculations
 
 
 def _parse(result: str) -> dict:
@@ -32,60 +50,171 @@ def _parse(result: str) -> dict:
         return {}
 
 
-def check_once() -> str | None:
+def _biz(service: str, endpoint: str | None = None) -> tuple[str, str]:
+    """Return (business_priority, business_reason) for a service/endpoint."""
+    if endpoint:
+        p = get_endpoint_priority(service, endpoint)
+    else:
+        p = get_service_priority(service)
+    return p["priority"], p["reason"]
+
+
+def check_once() -> list[dict] | None:
     """
     Run one anomaly-detection pass across all services.
-    Returns an anomaly description string if something is wrong, else None.
+
+    Returns a list of anomaly dicts if anything is wrong, else None.
+    Each dict: {id, description, severity, service, endpoint, metric, value,
+                business_priority, business_reason}
+    Severity: critical (error > 50%), high (error > 15% or mem delta > 80MB),
+              medium (p95 > 1500ms).
+
+    Endpoint-level anomalies are reported separately when per-endpoint breakdown
+    shows divergent failure rates across endpoints on the same service.
     """
-    anomalies = []
+    anomalies: list[dict] = []
 
     for service in ("api", "frontend"):
-        # ── error rate ─────────────────────────────────────────────────────
-        er = _parse(get_error_rate(service, WINDOW_MINUTES))
-        rate = er.get("error_rate_pct", 0)
-        if rate >= ERROR_RATE_THRESHOLD:
-            total   = er.get("total_requests", "?")
-            errors  = er.get("errors", "?")
-            anomalies.append(
-                f"High error rate on {service}: {rate}% "
-                f"({errors}/{total} requests failing in last {WINDOW_MINUTES}m)"
-            )
+        svc_biz_pri, svc_biz_reason = _biz(service)
+
+        # ── per-endpoint error rates (api only — api has meaningful endpoints) ──
+        ep_anomalies_added: set[str] = set()
+        if service == "api":
+            ep_data = _parse(get_endpoint_error_rates(service, WINDOW_MINUTES))
+            endpoints = ep_data.get("endpoints", {})
+            # Only report endpoint-level anomalies when endpoints diverge meaningfully
+            ep_rates = {
+                ep: info["error_rate_pct"]
+                for ep, info in endpoints.items()
+                if ep not in ("/health", "/metrics") and info.get("total", 0) >= 3
+            }
+            if ep_rates:
+                max_rate = max(ep_rates.values())
+                min_rate = min(ep_rates.values())
+                # Endpoints are diverging — report each failing endpoint separately
+                if max_rate - min_rate >= 20 and max_rate >= ERROR_RATE_THRESHOLD:
+                    for ep, rate in ep_rates.items():
+                        if rate >= ERROR_RATE_THRESHOLD:
+                            ep_total  = endpoints[ep]["total"]
+                            ep_errors = endpoints[ep]["errors"]
+                            severity  = "critical" if rate > 50 else "high"
+                            bp, br    = _biz(service, ep)
+                            anomalies.append({
+                                "id":                str(uuid.uuid4()),
+                                "description":       (
+                                    f"High error rate on {service}{ep}: {rate}% "
+                                    f"({ep_errors}/{ep_total} requests failing in last {WINDOW_MINUTES}m)"
+                                ),
+                                "severity":          severity,
+                                "service":           service,
+                                "endpoint":          ep,
+                                "metric":            "error_rate",
+                                "value":             rate,
+                                "business_priority": bp,
+                                "business_reason":   br,
+                            })
+                            ep_anomalies_added.add(ep)
+
+        # ── aggregate service error rate (skip if any endpoint-level data covers it) ──
+        # Even if endpoints didn't diverge enough to report individually, suppress the
+        # service-level aggregate when any endpoint is above threshold — endpoint data
+        # is strictly more informative and prevents 3-anomaly accumulation across polls.
+        any_ep_above_threshold = bool(ep_rates) and any(
+            rate >= ERROR_RATE_THRESHOLD for rate in ep_rates.values()
+        )
+        if not ep_anomalies_added and not any_ep_above_threshold:
+            er    = _parse(get_error_rate(service, WINDOW_MINUTES))
+            rate  = er.get("error_rate_pct", 0)
+            if rate >= ERROR_RATE_THRESHOLD:
+                total  = er.get("total_requests", "?")
+                errors = er.get("errors", "?")
+                severity = "critical" if rate > 50 else "high"
+                anomalies.append({
+                    "id":                str(uuid.uuid4()),
+                    "description":       (
+                        f"High error rate on {service}: {rate}% "
+                        f"({errors}/{total} requests failing in last {WINDOW_MINUTES}m)"
+                    ),
+                    "severity":          severity,
+                    "service":           service,
+                    "endpoint":          None,
+                    "metric":            "error_rate",
+                    "value":             rate,
+                    "business_priority": svc_biz_pri,
+                    "business_reason":   svc_biz_reason,
+                })
 
         # ── latency ────────────────────────────────────────────────────────
-        ls = _parse(get_latency_stats(service, WINDOW_MINUTES))
+        ls  = _parse(get_latency_stats(service, WINDOW_MINUTES))
         p95 = ls.get("p95_ms", 0)
         if p95 >= LATENCY_THRESHOLD_MS:
-            anomalies.append(
-                f"High latency on {service}: p95={p95}ms "
-                f"(threshold {LATENCY_THRESHOLD_MS}ms)"
-            )
+            anomalies.append({
+                "id":                str(uuid.uuid4()),
+                "description":       (
+                    f"High latency on {service}: p95={p95}ms "
+                    f"(threshold {LATENCY_THRESHOLD_MS}ms)"
+                ),
+                "severity":          "medium",
+                "service":           service,
+                "endpoint":          None,
+                "metric":            "p95_latency",
+                "value":             p95,
+                "business_priority": svc_biz_pri,
+                "business_reason":   svc_biz_reason,
+            })
 
         # ── memory growth ──────────────────────────────────────────────────
-        mt = _parse(get_memory_trend(service, window_minutes=5))
+        mt    = _parse(get_memory_trend(service, window_minutes=5))
         delta = mt.get("delta_mb", 0)
         last  = mt.get("last_mb", 0)
         if delta >= MEMORY_DELTA_THRESHOLD:
-            anomalies.append(
-                f"Memory growing rapidly on {service}: "
-                f"+{delta}MB in 5 minutes (now {last}MB)"
-            )
+            anomalies.append({
+                "id":                str(uuid.uuid4()),
+                "description":       (
+                    f"Memory growing rapidly on {service}: "
+                    f"+{delta}MB in 5 minutes (now {last}MB)"
+                ),
+                "severity":          "high",
+                "service":           service,
+                "endpoint":          None,
+                "metric":            "memory_delta",
+                "value":             delta,
+                "business_priority": svc_biz_pri,
+                "business_reason":   svc_biz_reason,
+            })
 
-    if not anomalies:
-        return None
+    return anomalies if anomalies else None
 
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    summary = "\n".join(f"  • {a}" for a in anomalies)
+
+def _build_anomaly_string(anomalies: list[dict]) -> str:
+    """Convert list of anomaly dicts to a human-readable investigation prompt."""
+    ts      = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    bullets = []
+    for a in anomalies:
+        biz = a.get("business_priority", "")
+        biz_note = f" [BIZ:{biz.upper()}]" if biz else ""
+        bullets.append(f"  • [{a['severity'].upper()}]{biz_note} {a['description']}")
     return (
-        f"[{ts}] Anomaly detected:\n{summary}\n\n"
-        f"Investigate root cause, determine blast radius, and recommend remediation."
+        f"[{ts}] {len(anomalies)} anomaly/anomalies detected:\n"
+        + "\n".join(bullets)
+        + "\n\nCall read_triage_config first to load the team's priority rules, "
+        "then triage by business priority and severity."
     )
+
+
+COLLECTION_WINDOW_SECS = 10.0
 
 
 def run(on_anomaly, poll_interval: float = POLL_INTERVAL):
     """
     Poll continuously.  Calls on_anomaly(description) when something is wrong.
     Will not re-trigger for the same incident until the system recovers
-    (error rate drops back below threshold).
+    (anomalies drop back to None).
+
+    Collection window: on first anomaly detection (healthy → unhealthy), waits
+    COLLECTION_WINDOW_SECS before triggering so slower-building faults have time
+    to cross their thresholds.  All unique anomalies accumulated across polls in
+    that window are passed to on_anomaly together.
     """
     from rich.console import Console
     console = Console()
@@ -98,23 +227,85 @@ def run(on_anomaly, poll_interval: float = POLL_INTERVAL):
         f"memory_delta>{MEMORY_DELTA_THRESHOLD}MB\n"
     )
 
-    incident_active = False
+    incident_active    = False
+    collecting         = False
+    collection_start   = 0.0
+    recovery_until     = 0.0   # grace period after incident_active flips False
+    # Keyed by (service, metric, endpoint) to deduplicate across polls
+    collected: dict[tuple[str, str, str], dict] = {}
 
     while True:
-        anomaly = check_once()
+        anomalies = check_once()
 
-        if anomaly and not incident_active:
-            incident_active = True
-            on_anomaly(anomaly)
+        in_grace = time.time() < recovery_until
 
-        elif not anomaly and incident_active:
-            incident_active = False
+        if anomalies and not incident_active and not in_grace:
+            if not collecting:
+                # Healthy → unhealthy: start collection window
+                collecting       = True
+                collection_start = time.time()
+                for a in anomalies:
+                    collected.setdefault((a["service"], a["metric"], a.get("endpoint") or ""), a)
+                console.print(
+                    "\n  [bold yellow]⚠ Anomaly detected — collecting for "
+                    f"{int(COLLECTION_WINDOW_SECS)}s to check for additional "
+                    "issues...[/bold yellow]"
+                )
+            else:
+                # Still in window — accumulate any new anomaly types
+                for a in anomalies:
+                    collected.setdefault((a["service"], a["metric"], a.get("endpoint") or ""), a)
+
+                elapsed = time.time() - collection_start
+                if elapsed >= COLLECTION_WINDOW_SECS:
+                    collecting      = False
+                    incident_active = True
+                    all_anomalies   = list(collected.values())
+                    collected       = {}
+                    count           = len(all_anomalies)
+                    noun            = "anomaly" if count == 1 else "anomalies"
+                    console.print(
+                        f"\n  [bold red]Collection complete — {count} {noun} "
+                        f"detected, starting triage.[/bold red]\n"
+                    )
+                    on_anomaly(_build_anomaly_string(all_anomalies))
+
+                    # Post-investigation cooldown: give the sliding window 60s to
+                    # flush stale pre-fix errors before accepting a new incident.
+                    console.print(
+                        "\n  [bold cyan]Incident resolved — cooldown 60s before "
+                        "resuming monitoring...[/bold cyan]\n"
+                    )
+                    time.sleep(60)
+
+        elif not anomalies and collecting:
+            # Cleared before window elapsed — cancel quietly
+            collecting = False
+            collected  = {}
             console.print(
-                "\n  [bold green]✓ System recovered — monitoring resumed[/bold green]\n"
+                "\n  [dim]Anomalies cleared during collection window "
+                "— monitoring resumed[/dim]\n"
             )
 
-        elif not anomaly:
+        elif not anomalies and incident_active:
+            incident_active = False
+            # 30-second grace period: stale errors may still be in the sliding
+            # window even though the system has actually recovered.
+            recovery_until  = time.time() + 30
+            console.print(
+                "\n  [bold green]✓ System recovered — 30s grace period before "
+                "re-arming monitor[/bold green]\n"
+            )
+
+        elif not anomalies:
             now = datetime.now().strftime("%H:%M:%S")
-            console.print(f"  [dim]{now}  all services healthy[/dim]", end="\r")
+            if in_grace:
+                remaining = int(recovery_until - time.time())
+                console.print(
+                    f"  [dim]{now}  grace period ({remaining}s remaining)[/dim]",
+                    end="\r",
+                )
+            else:
+                console.print(f"  [dim]{now}  all services healthy[/dim]", end="\r")
 
         time.sleep(poll_interval)

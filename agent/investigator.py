@@ -42,9 +42,48 @@ Stack: frontend:3000 → api:8000 → db:5432. Logs are mixed JSON + plain text.
 
 PHASE 1 — before any tools, write one line: "Plan: ..."
 
+If multiple anomalies are reported, TRIAGE FIRST in Phase 1:
+1. Call read_triage_config to load the team's priority rules.
+2. Call get_endpoint_error_rates to see per-endpoint breakdown.
+3. State each anomaly with its technical severity AND its business priority from the config.
+4. Apply the team's triage rules to determine investigation order.
+5. Explain your decision using the team's language — reference their reasons and rule names.
+6. If business priority conflicts with technical severity, follow business priority and explain why.
+7. Format the triage line as:
+   "Triage: [CRITICAL/BIZ:CRITICAL] <description> — investigating first per '<rule name>'. [HIGH/BIZ:MEDIUM] <description> — queued."
+
+When multiple endpoints on the same service are failing with different error rates:
+- Do NOT assume the highest error rate is most important.
+- A 40% error rate on /checkout (revenue-critical, $5,600/min) is worse than 95% on /products
+  (medium priority, no direct revenue loss).
+- Always check business priority before deciding investigation order.
+
+After resolving the first anomaly:
+- Call get_error_rate and get_latency_stats to verify whether queued anomalies self-resolved.
+- If a lower-priority anomaly resolved as a side effect, state:
+  "Cascade resolution: <anomaly> resolved as side effect of <fix> — confirming with metrics."
+- If still present, investigate it independently with the same two-phase protocol.
+- When calling execute_remediation with multiple faults active, always pass the
+  'fault' parameter to clear only the targeted fault — never clear all faults at once.
+
 PHASE 2 — investigate with tools, then:
+- After quantifying impact with error rates and logs, call capture_dashboard to get a visual
+  timeline of the incident. The spike shape is diagnostic — a cliff indicates a deploy, a ramp
+  indicates a leak, a step indicates a threshold breach.
+- Always capture at least one dashboard screenshot per investigation, even when handling multiple
+  faults. The visual evidence is essential for the post-mortem.
 - send_slack_alert (severity=critical) with root cause
+- Before calling execute_remediation, call get_active_faults to verify your diagnosis
+  matches an actual active fault. If your hypothesized root cause does not match any
+  active fault, re-examine your evidence — do NOT call execute_remediation.
 - CALL execute_remediation tool (triggers human y/N gate — do NOT just describe it)
+- After executing remediation, call get_error_rate or get_endpoint_error_rates to verify
+  the fix worked. If the error rate has NOT dropped significantly (still above threshold):
+  1. State that the remediation did not resolve the issue.
+  2. Call get_active_faults to check if other faults are still present.
+  3. Re-investigate with a revised hypothesis.
+  4. Attempt a different remediation targeting the correct fault.
+  Only escalate to manual intervention after TWO failed remediation attempts.
 - send_slack_alert (severity=resolved) after fix
 
 FINAL REPORT (be concise):
@@ -53,6 +92,10 @@ FINAL REPORT (be concise):
 ## Confidence [0-100%]
 ## Remediation taken
 ## Impact
+
+## Triage Decision
+State which triage rule was applied, business priority vs technical severity for each incident,
+and whether the priority decision was correct in hindsight.
 
 Meeting transcripts: if a meeting URL appears in Slack, call join_incident_meeting() to transcribe it. Use get_meeting_transcript() once done — avoid duplicating work the team already did live.
 
@@ -159,8 +202,10 @@ def investigate(anomaly: str,
     ))
     console.print()
 
-    max_turns  = 15
-    conclusion = ""
+    max_turns         = 40
+    conclusion        = ""
+    remediation_count = 0
+    report_injected   = False
 
     for turn in range(max_turns):
         response = client.chat(SYSTEM_PROMPT, messages, TOOL_SCHEMAS)
@@ -171,6 +216,9 @@ def investigate(anomaly: str,
 
         # ── Phase complete: agent wrote final report ───────────────────────
         if response.stop_reason == "end_turn":
+            num_text = sum(1 for b in response.content if b.type == "text")
+            _ilog({"event": "end_turn", "turn": turn, "num_text_blocks": num_text,
+                   "conclusion_length": len(conclusion)})
             for block in response.content:
                 if block.type == "text":
                     conclusion = block.text
@@ -215,6 +263,12 @@ def investigate(anomaly: str,
                         result = dispatch(block.name, block.input)
                         _ilog({"event": "remediation_executed", "action": action})
                         console.print("  [green]Remediation executed.[/green]")
+                        try:
+                            r_data = json.loads(result)
+                            if isinstance(r_data, dict) and r_data.get("status") == "success":
+                                remediation_count += 1
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            pass
                 else:
                     result = dispatch(block.name, block.input)
 
@@ -248,10 +302,72 @@ def investigate(anomaly: str,
                     "content":     tool_content,
                 })
 
+            # After 2+ successful remediations, inject a prompt to write the final report
+            # so the agent doesn't exhaust remaining turns on more tool calls.
+            if remediation_count >= 2 and not report_injected:
+                tool_results.append({
+                    "type": "text",
+                    "text": (
+                        "Both incidents have been resolved. "
+                        "Write your final ## Root Cause report now."
+                    ),
+                })
+                report_injected = True
+                _ilog({"event": "report_prompt_injected",
+                       "remediation_count": remediation_count})
+
             messages.append({"role": "user", "content": tool_results})
             continue
 
         break  # unexpected stop_reason
+    else:
+        # for-loop exhausted all turns without a break (no end_turn received)
+        _ilog({"event": "loop_exit", "reason": "max_turns_reached", "turn": turn,
+               "conclusion_length": len(conclusion)})
+
+    # ── Fallback conclusion if agent hit max_turns or end_turn without report ─
+    if not conclusion:
+        reasoning_lines:    list[str] = []
+        remediation_lines:  list[str] = []
+        last_error_rate:    str       = ""
+
+        try:
+            with open(RESOLVE_LOG) as f:
+                for raw in f:
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    ev = entry.get("event", "")
+                    if ev == "reasoning":
+                        text = entry.get("text", "").strip()
+                        if text:
+                            reasoning_lines.append(f"- {text}")
+                    elif ev == "remediation_executed":
+                        action = entry.get("action", "unknown")
+                        remediation_lines.append(f"- {action}")
+                    elif ev == "tool_result" and entry.get("tool") in (
+                        "get_error_rate", "get_endpoint_error_rates"
+                    ):
+                        last_error_rate = entry.get("result_preview", "")
+        except OSError:
+            pass
+
+        parts = [
+            "## Root Cause",
+            "[Auto-generated from investigation log — agent did not produce a structured conclusion]",
+            "",
+        ]
+        if reasoning_lines:
+            parts += ["**Agent reasoning:**"] + reasoning_lines + [""]
+        if remediation_lines:
+            parts += ["**Remediations executed:**"] + remediation_lines + [""]
+        if last_error_rate:
+            parts += ["**Last error-rate reading:**", last_error_rate, ""]
+
+        conclusion = "\n".join(parts)
+        _ilog({"event": "fallback_conclusion_generated",
+               "reason": "agent loop ended without structured report"})
 
     # ── Print + log final report ──────────────────────────────────────────
     console.print()

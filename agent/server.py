@@ -12,7 +12,8 @@ Usage:
 
 Endpoints:
     WS  /ws                          — real-time event stream + approval
-    POST /trigger/{fault_type}       — inject fault + start investigation
+    POST /trigger/{fault_type}       — inject single fault + start investigation
+    POST /trigger                    — body: {"faults": ["bad_deploy", "slow_db"]}
     POST /trigger/custom             — body: {"anomaly": "..."}
     GET  /health                     — liveness
     GET  /status                     — current agent state
@@ -23,6 +24,7 @@ import json
 import os
 import sys
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -31,6 +33,7 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -39,7 +42,8 @@ AGENT_DIR   = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR    = os.path.dirname(AGENT_DIR)
 LOG_DIR     = os.path.join(BASE_DIR, "logs")
 CHAOS_DIR   = os.path.join(BASE_DIR, "chaos")
-CHAOS_FILE  = os.path.join(CHAOS_DIR, "current_fault")
+CHAOS_FILE  = os.path.join(CHAOS_DIR, "current_fault")   # legacy
+CHAOS_JSON  = os.path.join(CHAOS_DIR, "faults.json")     # new primary
 
 sys.path.insert(0, AGENT_DIR)
 os.chdir(AGENT_DIR)  # investigator.py expects relative paths
@@ -61,8 +65,12 @@ app.add_middleware(
 _connections:     set[WebSocket] = set()
 _agent_status:    str            = "monitoring"
 _event_loop:      Optional[asyncio.AbstractEventLoop] = None
-_investigation_lock = threading.Lock()
+_investigation_lock   = threading.Lock()
 _investigation_running = False
+
+# Multi-incident tracking
+_incident_total:   int = 0   # how many anomalies in the current triage session
+_incident_current: int = 0   # which one is being investigated (1-based)
 
 # Approval bridge: investigation thread blocks on this event
 _approval_event    = threading.Event()
@@ -96,6 +104,50 @@ DEMO_TRIGGERS = {
         "  • High error rate on api: 503s on all endpoints (DB unreachable)\n"
         "  • Frontend error rate 100% — cannot reach api\n\n"
         "Investigate root cause, determine blast radius, and recommend remediation."
+    ),
+    "catalog_down": (
+        "Anomaly detected:\n"
+        "  • [CRITICAL] High error rate on api/products: ~95% requests returning 503\n"
+        "  • /checkout appears unaffected\n\n"
+        "Investigate root cause, determine blast radius, and recommend remediation."
+    ),
+    "checkout_degraded": (
+        "Anomaly detected:\n"
+        "  • [HIGH] Intermittent error rate on api/checkout: ~40% requests returning 500\n"
+        "  • /products appears unaffected\n\n"
+        "Investigate root cause, determine blast radius, and recommend remediation."
+    ),
+}
+
+# Multi-fault composite trigger descriptions
+MULTI_FAULT_TRIGGERS = {
+    frozenset(["bad_deploy", "slow_db"]): (
+        "2 anomalies detected simultaneously:\n"
+        "  • [CRITICAL] High error rate on api: /checkout returning 500s (~87% error rate)\n"
+        "  • [MEDIUM] High latency on api: p95=2800ms (threshold 1500ms) — slow DB queries\n\n"
+        "Triage by severity. Investigate the checkout error rate first (critical), "
+        "then check if the latency anomaly self-resolved."
+    ),
+    frozenset(["bad_deploy", "memory_leak"]): (
+        "2 anomalies detected simultaneously:\n"
+        "  • [CRITICAL] High error rate on api: /checkout returning 500s (~85% error rate)\n"
+        "  • [HIGH] Memory growing rapidly on api: +200MB in 5 minutes (now 890MB)\n\n"
+        "Triage by severity. Investigate the checkout error rate first (critical)."
+    ),
+    frozenset(["slow_db", "memory_leak"]): (
+        "2 anomalies detected simultaneously:\n"
+        "  • [HIGH] Memory growing rapidly on api: +200MB in 5 minutes (now 890MB)\n"
+        "  • [MEDIUM] High latency on api: p95=2800ms (threshold 1500ms) — slow DB queries\n\n"
+        "Triage by severity. Investigate the memory growth first (high), "
+        "then check if the latency anomaly self-resolved."
+    ),
+    frozenset(["catalog_down", "checkout_degraded"]): (
+        "2 endpoint anomalies detected on api:\n"
+        "  • [CRITICAL/BIZ:MEDIUM] High error rate on api/products: ~95% requests returning 503\n"
+        "  • [HIGH/BIZ:CRITICAL] Intermittent error rate on api/checkout: ~40% requests returning 500\n\n"
+        "IMPORTANT: Call read_triage_config first. Despite /products having a higher error rate, "
+        "the team's config marks /checkout as revenue-critical ($5,600/min). "
+        "Apply the 'Revenue-critical override' rule — investigate /checkout first."
     ),
 }
 
@@ -149,6 +201,8 @@ def _on_event(entry: dict) -> None:
 
     elif ev == "reasoning":
         text = entry.get("text", "")
+        text_lower = text.strip().lower()
+
         # Detect Phase 1 plan
         if text.strip().startswith("Plan:"):
             _emit({
@@ -156,11 +210,48 @@ def _on_event(entry: dict) -> None:
                 "text":      text.strip()[5:].strip(),
                 "timestamp": ts,
             })
+        # Detect triage statement embedded in plan text
+        elif "triage:" in text_lower:
+            _emit({
+                "type":      "plan",
+                "text":      text.strip(),
+                "timestamp": ts,
+            })
         else:
             _emit({
                 "type":      "reasoning",
                 "text":      text,
                 "timestamp": ts,
+            })
+
+        # Detect incident switch (agent moves to second anomaly)
+        if any(phrase in text_lower for phrase in (
+            "now investigating", "moving to", "next anomaly",
+            "investigating the second", "investigating 2/2",
+            "turning to the", "address the second",
+        )):
+            global _incident_current
+            if _incident_current < _incident_total:
+                _incident_current += 1
+            _emit({
+                "type":       "incident_switch",
+                "from_index": _incident_current - 1,
+                "to_index":   _incident_current,
+                "total":      _incident_total,
+                "reason":     text.strip()[:120],
+                "timestamp":  ts,
+            })
+            _set_status(f"investigating_{_incident_current}_{_incident_total}")
+
+        # Detect cascade resolution
+        if any(phrase in text_lower for phrase in (
+            "cascade resolution", "side effect", "resolved as a side effect",
+            "appears to have resolved", "self-resolved", "self resolved",
+        )):
+            _emit({
+                "type":       "cascade_resolved",
+                "reason":     text.strip()[:200],
+                "timestamp":  ts,
             })
 
     elif ev == "tool_call":
@@ -247,6 +338,44 @@ def _approval_cb(action: str, service: str, reason: str = "") -> bool:
     return _approval_decision == "approve"
 
 
+# ── Chaos file helpers ─────────────────────────────────────────────────────────
+
+def _read_faults() -> list[str]:
+    """Return the list of currently active faults."""
+    try:
+        with open(CHAOS_JSON) as f:
+            data = json.load(f)
+            faults = data.get("active_faults", [])
+            if isinstance(faults, list):
+                return faults
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    # Legacy fallback
+    try:
+        with open(CHAOS_FILE) as f:
+            fault = f.read().strip()
+            if fault and fault != "none":
+                return [fault]
+    except FileNotFoundError:
+        pass
+    return []
+
+
+def _read_chaos() -> str:
+    """Return active faults as a comma-separated string, or 'none'."""
+    faults = _read_faults()
+    return ",".join(faults) if faults else "none"
+
+
+def _write_faults(faults: list[str]) -> None:
+    """Write active fault list to both JSON and legacy file."""
+    os.makedirs(CHAOS_DIR, exist_ok=True)
+    with open(CHAOS_JSON, "w") as f:
+        json.dump({"active_faults": faults}, f)
+    with open(CHAOS_FILE, "w") as f:
+        f.write(faults[0] if faults else "none")
+
+
 # ── Metrics polling ────────────────────────────────────────────────────────────
 
 def _read_log_lines(service: str) -> list[str]:
@@ -305,22 +434,16 @@ def _compute_metrics(service: str) -> dict:
     }
 
 
-def _read_chaos() -> str:
-    try:
-        with open(CHAOS_FILE) as f:
-            return f.read().strip() or "none"
-    except FileNotFoundError:
-        return "none"
-
-
 async def _metrics_loop() -> None:
     """Background task: poll metrics every 5s and broadcast to all clients."""
     while True:
         try:
+            faults = _read_faults()
             await _broadcast({
                 "type":      "metrics",
                 "timestamp": _now(),
-                "fault":     _read_chaos(),
+                "fault":     faults[0] if faults else "none",   # primary (legacy)
+                "faults":    faults,                            # full list
                 "api":       _compute_metrics("api"),
                 "frontend":  _compute_metrics("frontend"),
             })
@@ -329,29 +452,76 @@ async def _metrics_loop() -> None:
         await asyncio.sleep(5)
 
 
+_COLLECTION_WINDOW_SECS = 10.0
+
+
 async def _monitor_loop() -> None:
     """
     Background task: mirrors monitor.py's anomaly detection.
     Polls check_once() every 5s; auto-starts investigation when threshold breached.
     Debounces — won't re-trigger while an investigation is already running.
+
+    Collection window: on first anomaly detection (healthy → unhealthy) waits
+    _COLLECTION_WINDOW_SECS before triggering so slower-building faults have time
+    to cross their thresholds.  Emits {type: "collecting"} WS events during the
+    window so the UI can show a "Scanning for additional issues…" indicator.
     """
-    from monitor import check_once
-    # ready=True  → system last seen clean; a new anomaly may trigger an investigation
-    # ready=False → post-incident; blocked until check_once() returns None, which
-    #               only happens once stale error logs age out of its 3-min window
-    ready = True
+    from monitor import check_once, _build_anomaly_string
+    ready            = True
+    collecting       = False
+    collection_start = 0.0
+    # Keyed by (service, metric, endpoint) to deduplicate across polls
+    collected: dict[tuple[str, str, str], dict] = {}
 
     while True:
         try:
-            anomaly = await asyncio.get_running_loop().run_in_executor(None, check_once)
+            anomalies = await asyncio.get_running_loop().run_in_executor(None, check_once)
 
-            if anomaly and not _investigation_running and ready:
-                ready = False
-                await _start_investigation(anomaly)
+            if anomalies and not _investigation_running and ready:
+                if not collecting:
+                    # Healthy → unhealthy: start collection window
+                    collecting       = True
+                    collection_start = time.monotonic()
+                    for a in anomalies:
+                        collected.setdefault((a["service"], a["metric"], a.get("endpoint") or ""), a)
+                    await _broadcast({
+                        "type":              "collecting",
+                        "anomalies_so_far":  list(collected.values()),
+                        "seconds_remaining": int(_COLLECTION_WINDOW_SECS),
+                        "timestamp":         _now(),
+                    })
+                else:
+                    # Still in window — accumulate any new anomaly types
+                    for a in anomalies:
+                        collected.setdefault((a["service"], a["metric"], a.get("endpoint") or ""), a)
 
-            elif not anomaly and not ready:
-                # check_once() returned clean → old log entries aged out → unlock
-                ready = True
+                    elapsed           = time.monotonic() - collection_start
+                    seconds_remaining = max(0, int(_COLLECTION_WINDOW_SECS - elapsed))
+
+                    if elapsed >= _COLLECTION_WINDOW_SECS:
+                        collecting    = False
+                        ready         = False
+                        all_anomalies = list(collected.values())
+                        collected     = {}
+                        anomaly_str   = _build_anomaly_string(all_anomalies)
+                        await _start_investigation(anomaly_str, anomalies=all_anomalies)
+                    else:
+                        await _broadcast({
+                            "type":              "collecting",
+                            "anomalies_so_far":  list(collected.values()),
+                            "seconds_remaining": seconds_remaining,
+                            "timestamp":         _now(),
+                        })
+
+            elif not anomalies and collecting:
+                # Cleared before window elapsed — cancel
+                collecting = False
+                collected  = {}
+
+            elif not anomalies and not ready:
+                ready      = True
+                collecting = False
+                collected  = {}
                 _set_status("monitoring")
                 _emit({
                     "type":      "agent_status",
@@ -368,13 +538,42 @@ async def _monitor_loop() -> None:
 
 # ── Investigation runner ───────────────────────────────────────────────────────
 
-def _run_investigation(anomaly: str, image_path: Optional[str] = None) -> None:
+def _run_investigation(anomaly: str,
+                       image_path: Optional[str] = None,
+                       anomalies: Optional[list[dict]] = None) -> None:
     """Runs in a thread pool. Streams events via _on_event callbacks."""
     global _investigation_running, _approval_decision
+    global _incident_total, _incident_current
 
     # Install callbacks
     investigator._event_callback    = _on_event
     investigator._approval_callback = _approval_cb
+
+    # Set up multi-incident tracking
+    if anomalies and len(anomalies) > 1:
+        severity_order = {"critical": 0, "high": 1, "medium": 2}
+        # Sort by business_priority first (when configured), then technical severity
+        sorted_anomalies = sorted(
+            anomalies,
+            key=lambda a: (
+                severity_order.get(a.get("business_priority", a.get("severity", "medium")), 2),
+                severity_order.get(a.get("severity", "medium"), 2),
+            )
+        )
+        _incident_total   = len(sorted_anomalies)
+        _incident_current = 1
+
+        # Emit triage event before investigation starts
+        _emit({
+            "type":           "triage",
+            "anomalies":      sorted_anomalies,
+            "priority_order": [a["id"] for a in sorted_anomalies],
+            "count":          len(sorted_anomalies),
+            "timestamp":      _now(),
+        })
+    else:
+        _incident_total   = 1
+        _incident_current = 1
 
     try:
         result = investigator.investigate(
@@ -384,11 +583,12 @@ def _run_investigation(anomaly: str, image_path: Optional[str] = None) -> None:
         )
         conclusion = result.get("conclusion", "")
 
-        # Generate post-mortem
+        # Generate post-mortem (with anomaly list for triage section)
         from postmortem import generate as gen_pm
         detected_at  = datetime.now(timezone.utc)
         resolved_at  = datetime.now(timezone.utc)
-        pm_path      = gen_pm(conclusion, detected_at, resolved_at)
+        pm_path      = gen_pm(conclusion, detected_at, resolved_at,
+                              anomalies=anomalies)
 
         # Read and emit the markdown
         try:
@@ -414,19 +614,22 @@ def _run_investigation(anomaly: str, image_path: Optional[str] = None) -> None:
         })
         _set_status("monitoring")
     finally:
-        global _investigation_running
         _investigation_running = False
+        _incident_total        = 0
+        _incident_current      = 0
         investigator._event_callback    = None
         investigator._approval_callback = None
 
 
-async def _start_investigation(anomaly: str, image_path: Optional[str] = None) -> bool:
+async def _start_investigation(anomaly: str,
+                               image_path: Optional[str] = None,
+                               anomalies: Optional[list[dict]] = None) -> bool:
     global _investigation_running
     if _investigation_running:
         return False
     _investigation_running = True
     loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, _run_investigation, anomaly, image_path)
+    loop.run_in_executor(None, _run_investigation, anomaly, image_path, anomalies)
     return True
 
 
@@ -476,9 +679,11 @@ async def health():
 
 @app.get("/status")
 async def status():
+    faults = _read_faults()
     return {
         "agent_status": _agent_status,
-        "fault":        _read_chaos(),
+        "fault":        faults[0] if faults else "none",
+        "faults":       faults,
         "metrics": {
             "api":      _compute_metrics("api"),
             "frontend": _compute_metrics("frontend"),
@@ -486,20 +691,91 @@ async def status():
     }
 
 
+class MultiFaultBody(BaseModel):
+    faults: list[str]
+
+
+@app.post("/trigger")
+async def trigger_multi(body: MultiFaultBody):
+    """Inject multiple faults simultaneously and start a triage investigation."""
+    faults = body.faults
+    if not faults:
+        return {"error": "faults list must be non-empty"}
+
+    valid_faults = set(DEMO_TRIGGERS.keys())
+    invalid = [f for f in faults if f not in valid_faults]
+    if invalid:
+        return {"error": f"Unknown faults: {invalid}. Valid: {sorted(valid_faults)}"}
+
+    # Write chaos files
+    _write_faults(faults)
+
+    fault_set = frozenset(faults)
+    if fault_set in MULTI_FAULT_TRIGGERS:
+        anomaly = MULTI_FAULT_TRIGGERS[fault_set]
+    else:
+        bullets = "\n".join(
+            f"  • {DEMO_TRIGGERS[f].split(chr(10))[1].strip()}" for f in faults
+        )
+        anomaly = (
+            f"{len(faults)} faults injected simultaneously:\n{bullets}\n\n"
+            "Triage by severity and investigate in priority order."
+        )
+
+    # Build synthetic anomaly dicts for triage events
+    severity_map = {
+        "bad_deploy":        ("critical", "error_rate",   87.0,   None,        "high",   "Core application server"),
+        "db_down":           ("critical", "error_rate",   100.0,  None,        "critical", "Single dependency — all services cascade"),
+        "memory_leak":       ("high",     "memory_delta", 200.0,  None,        "high",   "Core application server"),
+        "slow_db":           ("medium",   "p95_latency",  2800.0, None,        "high",   "Core application server"),
+        "catalog_down":      ("critical", "error_rate",   95.0,   "/products", "medium", "Product catalog — no direct revenue loss"),
+        "checkout_degraded": ("high",     "error_rate",   40.0,   "/checkout", "critical", "Payment processing — $5,600/min downtime cost"),
+    }
+    import uuid as _uuid
+    anomaly_dicts = []
+    for f in faults:
+        sm = severity_map.get(f, ("high", "unknown", 0, None, "high", ""))
+        severity, metric, value, endpoint, biz_pri, biz_reason = sm
+        anomaly_dicts.append({
+            "id":                str(_uuid.uuid4()),
+            "description":       DEMO_TRIGGERS[f].split("\n")[1].strip().lstrip("• "),
+            "severity":          severity,
+            "service":           "api",
+            "endpoint":          endpoint,
+            "metric":            metric,
+            "value":             value,
+            "business_priority": biz_pri,
+            "business_reason":   biz_reason,
+        })
+
+    image_path = None
+    if "memory_leak" in faults:
+        candidate = os.path.join(BASE_DIR, "assets", "grafana_memory_spike.png")
+        if os.path.exists(candidate):
+            image_path = candidate
+
+    started = await _start_investigation(anomaly, image_path, anomaly_dicts)
+    return {
+        "status":  "investigation started" if started else "already investigating",
+        "faults":  faults,
+        "anomaly": anomaly[:160],
+    }
+
+
 @app.post("/trigger/{fault_type}")
 async def trigger(fault_type: str):
+    """Single-fault trigger — backward compatible with existing UI."""
     if fault_type not in DEMO_TRIGGERS and fault_type != "none":
         return {"error": f"Unknown fault type: {fault_type}. "
                          f"Valid: {list(DEMO_TRIGGERS.keys())}"}
 
     # Inject chaos
-    os.makedirs(CHAOS_DIR, exist_ok=True)
-    with open(CHAOS_FILE, "w") as f:
-        f.write(fault_type)
-
     if fault_type == "none":
+        _write_faults([])
         _set_status("monitoring")
         return {"status": "chaos cleared"}
+
+    _write_faults([fault_type])
 
     anomaly = DEMO_TRIGGERS[fault_type].format(
         ts=datetime.now(timezone.utc).strftime("%H:%M:%S UTC")

@@ -22,7 +22,9 @@ from transcriber import transcribe_file, list_transcripts, get_transcript_conten
 LOG_DIR     = os.getenv("LOG_DIR",    "./logs")
 CONFIG_DIR  = os.getenv("CONFIG_DIR", "./configs")
 ASSETS_DIR  = os.getenv("ASSETS_DIR", "./assets")
-CHAOS_FILE  = os.path.join(os.getenv("CHAOS_DIR", "./chaos"), "current_fault")
+CHAOS_DIR   = os.getenv("CHAOS_DIR", "./chaos")
+CHAOS_FILE  = os.path.join(CHAOS_DIR, "current_fault")   # legacy
+CHAOS_JSON  = os.path.join(CHAOS_DIR, "faults.json")     # new primary
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
 
 from memory_tools import search_past_incidents, search_runbooks, search_slack
@@ -196,7 +198,8 @@ def list_services() -> str:
     return json.dumps(result, indent=2)
 
 
-def execute_remediation(action: str, service: str = "api") -> str:
+def execute_remediation(action: str, service: str = "api",
+                        fault: str | None = None) -> str:
     """
     Simulate a remediation action.
 
@@ -205,27 +208,116 @@ def execute_remediation(action: str, service: str = "api") -> str:
       restart   — restart the service (clears most faults)
       scale_up  — add capacity (illustrative for memory/load faults)
 
-    In the demo environment this writes "none" to the chaos flag so the
-    Docker services immediately resume normal behaviour.
+    fault: Optional specific fault name to clear (e.g. 'bad_deploy', 'slow_db').
+           When provided, only that fault is removed — other active faults remain.
+           When omitted, all active faults are cleared.
+
+    In the demo environment this updates the chaos JSON so Docker services
+    immediately resume normal behaviour on the next request.
     """
     valid = {"rollback", "restart", "scale_up"}
     if action not in valid:
         return f"[unknown action '{action}'. valid: {', '.join(valid)}]"
 
-    os.makedirs(os.path.dirname(CHAOS_FILE), exist_ok=True)
-    with open(CHAOS_FILE, "w") as f:
-        f.write("none")
+    os.makedirs(CHAOS_DIR, exist_ok=True)
+
+    cleared: list[str] = []
+
+    if fault:
+        # Remove only the targeted fault from the active list
+        try:
+            with open(CHAOS_JSON) as f:
+                data = json.load(f)
+            active = data.get("active_faults", [])
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Fall back: read legacy file
+            try:
+                with open(CHAOS_FILE) as f:
+                    legacy = f.read().strip()
+                active = [legacy] if legacy and legacy != "none" else []
+            except FileNotFoundError:
+                active = []
+
+        if fault not in active:
+            return json.dumps({
+                "status": "no_effect",
+                "message": (
+                    f"Fault '{fault}' is not currently active. "
+                    f"Active faults: {active}. "
+                    f"Your diagnosis may be incorrect — re-examine evidence."
+                ),
+            })
+
+        cleared  = [f for f in active if f == fault]
+        remaining = [f for f in active if f != fault]
+
+        with open(CHAOS_JSON, "w") as f:
+            json.dump({"active_faults": remaining}, f)
+        # Update legacy file
+        with open(CHAOS_FILE, "w") as f:
+            f.write(remaining[0] if remaining else "none")
+
+        still_active = remaining
+    else:
+        # Clear all faults
+        try:
+            with open(CHAOS_JSON) as f:
+                data = json.load(f)
+            cleared = data.get("active_faults", [])
+        except (FileNotFoundError, json.JSONDecodeError):
+            cleared = []
+
+        with open(CHAOS_JSON, "w") as f:
+            json.dump({"active_faults": []}, f)
+        with open(CHAOS_FILE, "w") as f:
+            f.write("none")
+
+        still_active = []
 
     messages = {
-        "rollback":  f"Rolled back {service} to previous stable version. Fault cleared.",
-        "restart":   f"Restarted {service}. Fault cleared.",
-        "scale_up":  f"Scaled {service} to additional replicas. Fault cleared.",
+        "rollback":  f"Rolled back {service} to previous stable version.",
+        "restart":   f"Restarted {service}.",
+        "scale_up":  f"Scaled {service} to additional replicas.",
     }
-    return json.dumps({"status": "success", "action": action,
-                        "service": service, "message": messages[action]})
+    return json.dumps({
+        "status":       "success",
+        "action":       action,
+        "service":      service,
+        "faults_cleared":  cleared,
+        "faults_remaining": still_active,
+        "message":      (
+            f"{messages[action]} "
+            f"Cleared: {cleared or 'all'}. "
+            f"Still active: {still_active or 'none'}."
+        ),
+    })
 
 
 # ── NEW: multimodal + external integration tools ─────────────────────────────
+
+def get_active_faults() -> str:
+    """
+    Return the list of fault scenarios currently active in the demo environment.
+    Reads the chaos control file to determine which faults are running.
+    """
+    try:
+        with open(CHAOS_JSON) as f:
+            data = json.load(f)
+        active = data.get("active_faults", [])
+        if isinstance(active, list):
+            return json.dumps({"active_faults": active, "count": len(active)})
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    # Legacy fallback
+    try:
+        with open(CHAOS_FILE) as f:
+            fault = f.read().strip()
+        if fault and fault != "none":
+            return json.dumps({"active_faults": [fault], "count": 1})
+    except FileNotFoundError:
+        pass
+    return json.dumps({"active_faults": [], "count": 0})
+
 
 def read_config_file(filename: str) -> str:
     """
@@ -373,6 +465,54 @@ def get_meeting_transcript(bot_id: str) -> str:
     when the meeting ended), then falls back to polling the Recall.ai API.
     """
     return get_bot_transcript(bot_id)
+
+
+def read_triage_config() -> str:
+    """
+    Return the team's triage priority configuration as formatted text.
+    Includes service priorities, endpoint priorities, and custom triage rules.
+    """
+    try:
+        from config import get_triage_context
+        return get_triage_context()
+    except Exception as e:
+        return json.dumps({"error": f"Failed to load triage config: {e}"})
+
+
+def get_endpoint_error_rates(service: str, window_minutes: int = 5) -> str:
+    """Return error rates broken down by individual endpoint for a service."""
+    since   = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    entries = _parse_entries(_read_log_lines(service), since=since)
+
+    requests = [e for e in entries if e.get("event") == "request"]
+    if not requests:
+        return json.dumps({
+            "service": service, "window_minutes": window_minutes,
+            "endpoints": {}, "note": "no request events in window",
+        })
+
+    by_endpoint: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "errors": 0})
+    for req in requests:
+        ep = req.get("endpoint", "unknown")
+        by_endpoint[ep]["total"] += 1
+        if req.get("status_code", 200) >= 400:
+            by_endpoint[ep]["errors"] += 1
+
+    result: dict[str, dict] = {}
+    for ep, counts in by_endpoint.items():
+        total  = counts["total"]
+        errors = counts["errors"]
+        result[ep] = {
+            "total":          total,
+            "errors":         errors,
+            "error_rate_pct": round(errors / total * 100, 1) if total else 0.0,
+        }
+
+    return json.dumps({
+        "service":        service,
+        "window_minutes": window_minutes,
+        "endpoints":      result,
+    }, indent=2)
 
 
 def capture_dashboard(window_minutes: int = 15) -> str:
@@ -572,6 +712,16 @@ TOOL_SCHEMAS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "get_active_faults",
+        "description": (
+            "Check which fault scenarios are currently active in the demo environment. "
+            "Use this to confirm your root cause hypothesis matches an actual active fault "
+            "before attempting remediation. If your hypothesized fault is not in the returned "
+            "list, re-examine your evidence — the error messages may have misled you."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "read_config_file",
         "description": "Read a deployment config or manifest file (YAML, JSON, .env). Use this to find misconfigured env vars, missing secrets, or resource limits that may be causing the incident.",
         "input_schema": {
@@ -614,13 +764,23 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "execute_remediation",
-        "description": "Execute a remediation action on a service. ONLY call this after the human operator has approved.",
+        "description": (
+            "Execute a remediation action on a service. ONLY call this after the human "
+            "operator has approved. When multiple faults are active, pass the 'fault' "
+            "parameter to clear only the targeted fault without affecting others."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "action":  {"type": "string", "enum": ["rollback", "restart", "scale_up"],
                             "description": "rollback=revert deploy, restart=restart service, scale_up=add capacity"},
                 "service": {"type": "string", "enum": ["api", "frontend"], "default": "api"},
+                "fault":   {"type": "string",
+                            "description": (
+                                "Specific fault to clear (e.g. 'bad_deploy', 'slow_db'). "
+                                "Required when multiple faults are active so other faults "
+                                "are not accidentally cleared."
+                            )},
             },
             "required": ["action"],
         },
@@ -668,6 +828,34 @@ TOOL_SCHEMAS = [
                 "incident_type": {"type": "string", "description": "Incident type hint (e.g. 'payment', 'memory', 'database', 'deploy')"},
             },
             "required": [],
+        },
+    },
+    {
+        "name": "read_triage_config",
+        "description": (
+            "Read the team's triage priority configuration. Call this when multiple anomalies "
+            "are detected to understand which services and endpoints the team considers most "
+            "critical and why. Returns service priorities, endpoint priorities, and custom "
+            "triage rules defined by the team. Always call this before deciding investigation "
+            "order when multiple anomalies are present."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_endpoint_error_rates",
+        "description": (
+            "Get error rates broken down by endpoint for a service. Use this when the overall "
+            "service error rate is high but you need to identify which specific endpoints are "
+            "failing. Helps determine blast radius and triage priority — a 40% error rate on "
+            "a revenue-critical endpoint may be worse than 95% on a low-priority endpoint."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "service":        {"type": "string", "enum": ["api", "frontend"]},
+                "window_minutes": {"type": "integer", "default": 5},
+            },
+            "required": ["service"],
         },
     },
     {
@@ -759,15 +947,18 @@ TOOL_FN_MAP = {
     "get_recent_errors":      lambda i: get_recent_errors(i["service"], i.get("limit", 20)),
     "get_deploy_history":     lambda i: get_deploy_history(i.get("window_minutes", 60)),
     "list_services":          lambda i: list_services(),
+    "get_active_faults":      lambda i: get_active_faults(),
     "read_config_file":       lambda i: read_config_file(i["filename"]),
     "list_config_files":      lambda i: list_config_files(),
     "parse_stack_traces":     lambda i: parse_stack_traces(i["service"], i.get("limit", 5)),
     "send_slack_alert":       lambda i: send_slack_alert(i["message"], i.get("severity", "warning")),
-    "execute_remediation":    lambda i: execute_remediation(i["action"], i.get("service", "api")),
+    "execute_remediation":    lambda i: execute_remediation(i["action"], i.get("service", "api"), i.get("fault")),
     "search_past_incidents":  lambda i: search_past_incidents(i["query"]),
     "search_runbooks":        lambda i: search_runbooks(i["query"]),
     "search_slack":           lambda i: search_slack(i["query"], i.get("limit", 10)),
     "get_team_availability":  lambda i: get_team_availability(i.get("incident_type", "")),
+    "read_triage_config":     lambda i: read_triage_config(),
+    "get_endpoint_error_rates": lambda i: get_endpoint_error_rates(i["service"], i.get("window_minutes", 5)),
     "get_past_transcripts":   lambda i: get_past_transcripts(i.get("query", "")),
     "transcribe_recording":   lambda i: transcribe_recording(i.get("filename") or i.get("audio_path", "")),
     "read_transcript":        lambda i: read_transcript(i["filename"]),

@@ -1,0 +1,34 @@
+services:
+  api:
+    priority: critical
+    reason: "Core application server — all customer flows depend on it"
+    endpoints:
+      /checkout:
+        priority: critical
+        reason: "Payment processing — direct revenue. $5,600/min downtime cost"
+      /products:
+        priority: medium
+        reason: "Product catalog — customers can't browse, but existing carts and saved items still work. No direct revenue loss."
+      /health:
+        priority: low
+        reason: "Internal health check — no customer impact"
+  frontend:
+    priority: high
+    reason: "Customer-facing UI — affects UX but API still serves mobile"
+  db:
+    priority: critical
+    reason: "Single dependency — all services cascade from DB failures"
+
+triage_rules:
+  - name: "Revenue-critical override"
+    condition: "Any incident affecting /checkout or payment flows"
+    action: "Investigate first even if other endpoints have worse metrics"
+  - name: "Catalog can wait"
+    condition: "/products degraded but /checkout is also degraded"
+    action: "Fix checkout first — customers with items in cart can still pay"
+  - name: "Data layer priority"
+    condition: "Database incidents cascade to all services"
+    action: "Investigate before application-layer issues unless checkout is down"
+  - name: "Default"
+    condition: "All else equal"
+    action: "Triage by severity metrics (critical > high > medium)"

@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import {
   AlertCircle, FileText, Wrench, Database, Image,
-  Brain, Zap, CheckCircle2, XCircle, FileCheck, ChevronDown, ChevronUp
+  Brain, Zap, CheckCircle2, XCircle, FileCheck, ChevronDown, ChevronUp,
+  ListOrdered, Link2, Minus
 } from 'lucide-react'
 
 // ── Shared primitives ────────────────────────────────────────────────────────
@@ -339,6 +340,161 @@ function PostmortemEntry({ entry }) {
   )
 }
 
+// ── Multi-incident entry types ────────────────────────────────────────────────
+
+const SEVERITY_STYLES = {
+  critical: { badge: 'bg-r-red-d border-r-red/40 text-r-red',     label: 'CRITICAL' },
+  high:     { badge: 'bg-r-amb-d border-r-amber/40 text-r-amber', label: 'HIGH' },
+  medium:   { badge: 'bg-r-cyan-d border-r-cyan/40 text-r-cyan',  label: 'MEDIUM' },
+}
+
+function SeverityBadge({ severity }) {
+  const s = SEVERITY_STYLES[severity] || SEVERITY_STYLES.medium
+  return (
+    <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border ${s.badge}`}>
+      {s.label}
+    </span>
+  )
+}
+
+const BIZ_PRIORITY_STYLES = {
+  critical: 'text-r-red font-semibold',
+  high:     'text-r-amber font-semibold',
+  medium:   'text-r-cyan',
+  low:      'text-r-dim',
+}
+
+function TriageEntry({ entry }) {
+  const anomalies = entry.anomalies || []
+  // Sort by business_priority first (if present), then technical severity
+  const order = { critical: 0, high: 1, medium: 2, low: 3 }
+  const sorted = [...anomalies].sort((a, b) => {
+    const bizA = order[a.business_priority] ?? order[a.severity] ?? 2
+    const bizB = order[b.business_priority] ?? order[b.severity] ?? 2
+    if (bizA !== bizB) return bizA - bizB
+    return (order[a.severity] ?? 2) - (order[b.severity] ?? 2)
+  })
+
+  // Detect business priority overrides — where biz priority differs from tech severity rank
+  const hasOverride = sorted.some(a =>
+    a.business_priority && a.business_priority !== a.severity &&
+    (order[a.business_priority] ?? 2) < (order[a.severity] ?? 2)
+  )
+
+  // Find the first anomaly where biz_priority > tech_severity (lower number = higher priority)
+  const overrideAnomaly = sorted.find(a =>
+    a.business_priority && a.business_priority !== a.severity &&
+    (order[a.business_priority] ?? 2) < (order[a.severity] ?? 2)
+  )
+
+  return (
+    <div className="animate-incident-in flex gap-3 p-4 rounded border-2 border-r-amber bg-r-amb-d/30">
+      <ListOrdered size={16} className="text-r-amber flex-shrink-0 mt-0.5" />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-2">
+          <span className="font-mono text-[10px] font-semibold text-r-amber uppercase tracking-widest">
+            Triage — {anomalies.length} anomalies detected
+          </span>
+          <Ts ts={entry.ts} />
+        </div>
+
+        {/* Business priority override callout */}
+        {hasOverride && overrideAnomaly && (
+          <div className="mb-2.5 px-2.5 py-1.5 rounded border border-r-red/40 bg-r-red-d/30
+            flex items-start gap-1.5">
+            <Zap size={11} className="text-r-red flex-shrink-0 mt-0.5" />
+            <span className="font-mono text-[10px] text-r-red leading-relaxed">
+              Business priority override — {overrideAnomaly.endpoint || overrideAnomaly.service} marked {overrideAnomaly.business_priority}-priority by team
+              {overrideAnomaly.business_reason ? `: ${overrideAnomaly.business_reason}` : ''}
+            </span>
+          </div>
+        )}
+
+        <div className="flex flex-col gap-2">
+          {sorted.map((a, i) => {
+            const bizPriStyle = BIZ_PRIORITY_STYLES[a.business_priority] || 'text-r-dim'
+            const bizOverride = a.business_priority && a.business_priority !== a.severity &&
+              (order[a.business_priority] ?? 2) < (order[a.severity] ?? 2)
+            return (
+              <div key={a.id || i} className="flex flex-col gap-0.5">
+                <div className="flex items-start gap-2">
+                  <span className="font-mono text-[10px] text-r-dim flex-shrink-0 mt-0.5">
+                    {i + 1}.
+                  </span>
+                  <SeverityBadge severity={a.severity} />
+                  {a.business_priority && (
+                    <span className={`font-mono text-[9px] px-1.5 py-0.5 rounded border
+                      border-r-border bg-r-muted ${bizPriStyle}`}>
+                      BIZ:{a.business_priority.toUpperCase()}
+                      {bizOverride && ' ⚡'}
+                    </span>
+                  )}
+                  <span className="font-mono text-[11px] text-r-text leading-relaxed">
+                    {a.endpoint ? (
+                      <><span className="text-r-cyan">{a.endpoint}</span>{' '}</>
+                    ) : null}
+                    {a.description}
+                    {i === 0 && (
+                      <span className="ml-2 font-mono text-[9px] text-r-amber">
+                        — investigating first
+                      </span>
+                    )}
+                    {i > 0 && (
+                      <span className="ml-2 font-mono text-[9px] text-r-dim">
+                        — queued
+                      </span>
+                    )}
+                  </span>
+                </div>
+                {a.business_reason && (
+                  <div className="ml-6 font-mono text-[9px] text-r-dim italic leading-relaxed">
+                    {a.business_reason}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function IncidentSeparatorEntry({ entry }) {
+  return (
+    <div className="flex items-center gap-3 py-2">
+      <div className="flex-1 h-px bg-r-border" />
+      <div className="flex items-center gap-1.5 px-3 py-1 rounded border border-r-border bg-r-surface">
+        <Minus size={10} className="text-r-dim" />
+        <span className="font-mono text-[9px] text-r-dim uppercase tracking-widest">
+          {entry.label || `Incident ${entry.to_index} / ${entry.total}`}
+        </span>
+        <Minus size={10} className="text-r-dim" />
+      </div>
+      <div className="flex-1 h-px bg-r-border" />
+    </div>
+  )
+}
+
+function CascadeResolvedEntry({ entry }) {
+  return (
+    <Card accent="green" className="bg-r-grn-d/30">
+      <Link2 size={13} className="text-r-green flex-shrink-0 mt-0.5" />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-0.5">
+          <span className="font-mono text-[10px] font-semibold text-r-green uppercase tracking-widest">
+            Cascade Resolution
+          </span>
+          <Ts ts={entry.ts} />
+        </div>
+        <p className="font-mono text-[11px] text-r-text/80 leading-relaxed italic">
+          {entry.reason || 'Anomaly resolved as a side effect of the previous fix.'}
+        </p>
+      </div>
+    </Card>
+  )
+}
+
 // ── Dispatch ─────────────────────────────────────────────────────────────────
 
 export default function TraceEntry({ entry, approvalEntryId, onApprove, onReject }) {
@@ -346,6 +502,9 @@ export default function TraceEntry({ entry, approvalEntryId, onApprove, onReject
 
   switch (entry.type) {
     case 'anomaly_detected':   return <AnomalyEntry entry={entry} />
+    case 'triage':             return <TriageEntry entry={entry} />
+    case 'incident_separator': return <IncidentSeparatorEntry entry={entry} />
+    case 'cascade_resolved':   return <CascadeResolvedEntry entry={entry} />
     case 'plan':               return <PlanEntry entry={entry} />
     case 'tool_call':          return <ToolCallEntry entry={entry} />
     case 'tool_result':        return <ToolResultEntry entry={entry} />

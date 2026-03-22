@@ -15,8 +15,9 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-LOG_FILE   = "/app/logs/api.log"
-CHAOS_FILE = "/app/chaos/current_fault"
+LOG_FILE    = "/app/logs/api.log"
+CHAOS_FILE  = "/app/chaos/current_fault"   # legacy
+CHAOS_JSON  = "/app/chaos/faults.json"     # new primary
 
 # In-memory leak buffer — grows when memory_leak fault is active
 _leak_buffer: list = []
@@ -57,12 +58,31 @@ def log_stacktrace(error: Exception, context: str):
 
 # ── Chaos control ─────────────────────────────────────────────────────────────
 
-def get_fault() -> str:
+def get_faults() -> list[str]:
+    """Return all active faults. Reads JSON format, falls back to legacy string."""
+    try:
+        with open(CHAOS_JSON) as f:
+            data = json.load(f)
+            faults = data.get("active_faults", [])
+            if isinstance(faults, list):
+                return faults
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    # Legacy fallback
     try:
         with open(CHAOS_FILE) as f:
-            return f.read().strip()
+            fault = f.read().strip()
+            if fault and fault != "none":
+                return [fault]
     except FileNotFoundError:
-        return "none"
+        pass
+    return []
+
+
+def get_fault() -> str:
+    """Legacy single-fault accessor — returns primary fault or 'none'."""
+    faults = get_faults()
+    return faults[0] if faults else "none"
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -106,16 +126,23 @@ def metrics():
 
 @app.route("/products")
 def products():
-    start = time.time()
-    fault = get_fault()
+    start  = time.time()
+    faults = get_faults()
 
     try:
-        if fault == "db_down":
+        if "catalog_down" in faults:
+            latency = round((time.time() - start) * 1000)
+            log("ERROR", "request", endpoint="/products", method="GET",
+                status_code=503, latency_ms=latency,
+                error="Product catalog service unavailable — upstream dependency failure")
+            return jsonify({"error": "Product catalog service unavailable — upstream dependency failure"}), 503
+
+        if "db_down" in faults:
             raise psycopg2.OperationalError(
                 "could not connect to server: Connection refused (host=db, port=5432)"
             )
 
-        if fault == "slow_db":
+        if "slow_db" in faults:
             log("WARN", "db_query", message="Query running slow — DB latency elevated", latency_hint_ms=2500)
             time.sleep(2.5)
 
@@ -139,37 +166,51 @@ def products():
 @app.route("/checkout", methods=["POST"])
 def checkout():
     start   = time.time()
-    fault   = get_fault()
+    faults  = get_faults()
     req_id  = str(uuid.uuid4())[:8]
     payload = request.get_json(silent=True) or {}
 
-    # ── bad_deploy: payment gateway misconfigured ──────────────────────────
-    if fault == "bad_deploy":
+    # ── checkout_degraded: ~40% of requests fail intermittently ──────────
+    if "checkout_degraded" in faults:
+        if random.random() < 0.4:
+            latency = round((time.time() - start) * 1000)
+            log("ERROR", "request", endpoint="/checkout", method="POST",
+                status_code=500, latency_ms=latency, request_id=req_id,
+                error="Payment gateway upstream timeout — intermittent connectivity to payments.internal",
+                detail="Upstream payment processor returned ETIMEDOUT after 30s")
+            return jsonify({
+                "error": "Payment gateway upstream timeout — intermittent connectivity to payments.internal",
+                "code":  "PAYMENT_GATEWAY_TIMEOUT",
+                "request_id": req_id,
+            }), 500
+
+    # ── bad_deploy fires first: payment gateway misconfigured ─────────────
+    if "bad_deploy" in faults:
         latency = round((time.time() - start) * 1000)
         log("ERROR", "request", endpoint="/checkout", method="POST",
             status_code=500, latency_ms=latency, request_id=req_id,
-            error="Payment gateway connection refused",
+            error="Payment gateway connection refused — PAYMENT_GATEWAY_URL misconfigured in v2.1 deploy",
             detail="PAYMENT_GATEWAY_URL misconfigured in v2.1 deploy — env var override missing")
         return jsonify({
-            "error": "Payment gateway unavailable",
+            "error": "Payment gateway connection refused — PAYMENT_GATEWAY_URL misconfigured in v2.1 deploy",
             "code":  "PAYMENT_GATEWAY_ERROR",
             "request_id": req_id,
         }), 500
 
     # ── memory_leak: buffer grows with each request ────────────────────────
-    if fault == "memory_leak":
+    if "memory_leak" in faults:
         _leak_buffer.extend([b"x" * 1024] * 512)   # +512 KB per request
         log("WARN", "memory", message="Memory growing",
             memory_mb=round(psutil.Process().memory_info().rss / 1024 / 1024, 1),
             leak_buffer_kb=len(_leak_buffer))
 
     try:
-        if fault == "db_down":
+        if "db_down" in faults:
             raise psycopg2.OperationalError(
                 "could not connect to server: Connection refused (host=db, port=5432)"
             )
 
-        if fault == "slow_db":
+        if "slow_db" in faults:
             time.sleep(2.5)
 
         with get_conn() as conn:

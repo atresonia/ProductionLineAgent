@@ -2,19 +2,40 @@ import { useState, useEffect } from 'react'
 import { Wifi, WifiOff, Zap, ChevronDown } from 'lucide-react'
 
 const STATUS_CONFIG = {
-  monitoring:         { label: 'MONITORING',         color: 'text-r-dim',  bg: 'bg-r-muted',    dot: 'bg-r-dim' },
-  investigating:      { label: 'INVESTIGATING',       color: 'text-r-amber',bg: 'bg-r-amb-d',    dot: 'bg-r-amber animate-dot-pulse' },
-  awaiting_approval:  { label: 'AWAITING APPROVAL',  color: 'text-r-amber',bg: 'bg-r-amb-d',    dot: 'bg-r-amber animate-dot-pulse' },
-  resolved:           { label: 'RESOLVED',            color: 'text-r-green',bg: 'bg-r-grn-d',    dot: 'bg-r-green' },
-  idle:               { label: 'IDLE',                color: 'text-r-dim',  bg: 'bg-r-muted',    dot: 'bg-r-dim' },
+  monitoring:         { label: 'MONITORING',        color: 'text-r-dim',   bg: 'bg-r-muted',  dot: 'bg-r-dim' },
+  investigating:      { label: 'INVESTIGATING',      color: 'text-r-amber', bg: 'bg-r-amb-d',  dot: 'bg-r-amber animate-dot-pulse' },
+  awaiting_approval:  { label: 'AWAITING APPROVAL', color: 'text-r-amber', bg: 'bg-r-amb-d',  dot: 'bg-r-amber animate-dot-pulse' },
+  resolved:           { label: 'RESOLVED',           color: 'text-r-green', bg: 'bg-r-grn-d',  dot: 'bg-r-green' },
+  idle:               { label: 'IDLE',               color: 'text-r-dim',   bg: 'bg-r-muted',  dot: 'bg-r-dim' },
 }
 
-const FAULT_TRIGGERS = [
-  { key: 'bad_deploy',  label: 'bad_deploy',  desc: 'Payment gateway misconfigured' },
-  { key: 'memory_leak', label: 'memory_leak', desc: 'API memory leak' },
-  { key: 'slow_db',     label: 'slow_db',     desc: 'DB query slowdown' },
-  { key: 'db_down',     label: 'db_down',     desc: 'DB connection refused' },
-  { key: 'none',        label: 'clear fault', desc: 'Restore normal operation' },
+// Single-fault triggers shown in the menu
+const SINGLE_FAULT_TRIGGERS = [
+  { key: 'bad_deploy',        label: 'bad_deploy',        desc: 'Payment gateway misconfigured' },
+  { key: 'memory_leak',       label: 'memory_leak',       desc: 'API memory leak' },
+  { key: 'slow_db',           label: 'slow_db',           desc: 'DB query slowdown' },
+  { key: 'db_down',           label: 'db_down',           desc: 'DB connection refused' },
+  { key: 'catalog_down',      label: 'catalog_down',      desc: '/products 503 — catalog unavailable' },
+  { key: 'checkout_degraded', label: 'checkout_degraded', desc: '/checkout ~40% failures (intermittent)' },
+]
+
+// Multi-fault triage scenarios — each key is an array passed to onTrigger
+const MULTI_FAULT_TRIGGERS = [
+  {
+    key:   ['catalog_down', 'checkout_degraded'],
+    label: 'catalog_down + checkout_degraded',
+    desc:  'Business priority demo — 95% /products vs 40% /checkout (revenue-critical wins)',
+  },
+  {
+    key:   ['bad_deploy', 'slow_db'],
+    label: 'bad_deploy + slow_db',
+    desc:  'CRITICAL checkout errors + MEDIUM DB latency (triage demo)',
+  },
+  {
+    key:   ['bad_deploy', 'memory_leak'],
+    label: 'bad_deploy + memory_leak',
+    desc:  'CRITICAL checkout errors + HIGH memory growth',
+  },
 ]
 
 function IncidentTimer({ start, end }) {
@@ -71,11 +92,20 @@ function ServiceDot({ label, status }) {
 
 export default function StatusBar({
   status, wsConnected, incidentStart, incidentEnd,
-  serviceHealth, fault, onTrigger
+  serviceHealth, fault, faults = [], incidentTotal = 0, incidentCurrent = 0,
+  onTrigger
 }) {
-  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.monitoring
+  const cfg      = STATUS_CONFIG[status] || STATUS_CONFIG.monitoring
   const isActive = status === 'investigating' || status === 'awaiting_approval'
   const [menuOpen, setMenuOpen] = useState(false)
+
+  // Build status label — show progress counter during multi-incident triage
+  const statusLabel = (isActive && incidentTotal > 1)
+    ? `INVESTIGATING ${incidentCurrent}/${incidentTotal}`
+    : cfg.label
+
+  // Active fault chips (multi-fault or single)
+  const activeFaults = faults.length > 0 ? faults : (fault && fault !== 'none' ? [fault] : [])
 
   return (
     <div className={`flex items-center h-12 px-4 gap-4 flex-shrink-0
@@ -98,17 +128,19 @@ export default function StatusBar({
         border border-r-border ${cfg.bg}`}>
         <div className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
         <span className={`font-mono text-[10px] font-semibold tracking-widest ${cfg.color}`}>
-          {cfg.label}
+          {statusLabel}
         </span>
       </div>
 
-      {/* Current fault chip */}
-      {fault && fault !== 'none' && (
-        <div className="flex items-center gap-1.5 px-2 py-0.5 rounded
-          bg-r-red-d border border-r-red/20">
-          <span className="font-mono text-[10px] text-r-red font-semibold">{fault}</span>
-        </div>
-      )}
+      {/* Active fault chips — one per fault */}
+      <div className="flex items-center gap-1.5">
+        {activeFaults.map(f => (
+          <div key={f} className="flex items-center gap-1 px-2 py-0.5 rounded
+            bg-r-red-d border border-r-red/20">
+            <span className="font-mono text-[10px] text-r-red font-semibold">{f}</span>
+          </div>
+        ))}
+      </div>
 
       {/* Center — timer */}
       <div className="flex-1 flex justify-center">
@@ -136,22 +168,55 @@ export default function StatusBar({
         </button>
 
         {menuOpen && (
-          <div className="absolute right-0 top-full mt-1 z-50 w-52
+          <div className="absolute right-0 top-full mt-1 z-50 w-64
             bg-r-surface border border-r-border rounded shadow-2xl overflow-hidden">
-            {FAULT_TRIGGERS.map(f => (
+
+            {/* Single faults */}
+            {SINGLE_FAULT_TRIGGERS.map(f => (
               <button
                 key={f.key}
                 onClick={() => { onTrigger(f.key); setMenuOpen(false) }}
                 className="w-full text-left px-3 py-2 hover:bg-r-raised
-                  flex flex-col gap-0.5 border-b border-r-border/50 last:border-0"
+                  flex flex-col gap-0.5 border-b border-r-border/50"
               >
-                <span className={`font-mono text-[11px] font-semibold
-                  ${f.key === 'none' ? 'text-r-green' : 'text-r-amber'}`}>
+                <span className="font-mono text-[11px] font-semibold text-r-amber">
                   {f.label}
                 </span>
                 <span className="font-mono text-[10px] text-r-dim">{f.desc}</span>
               </button>
             ))}
+
+            {/* Multi-fault triage scenarios */}
+            <div className="px-3 pt-2 pb-1">
+              <span className="font-mono text-[9px] text-r-dim uppercase tracking-widest">
+                triage scenarios
+              </span>
+            </div>
+            {MULTI_FAULT_TRIGGERS.map(f => (
+              <button
+                key={f.label}
+                onClick={() => { onTrigger(f.key); setMenuOpen(false) }}
+                className="w-full text-left px-3 py-2 hover:bg-r-raised
+                  flex flex-col gap-0.5 border-b border-r-border/50"
+              >
+                <span className="font-mono text-[11px] font-semibold text-r-red">
+                  {f.label}
+                </span>
+                <span className="font-mono text-[10px] text-r-dim">{f.desc}</span>
+              </button>
+            ))}
+
+            {/* Clear */}
+            <button
+              onClick={() => { onTrigger('none'); setMenuOpen(false) }}
+              className="w-full text-left px-3 py-2 hover:bg-r-raised
+                flex flex-col gap-0.5"
+            >
+              <span className="font-mono text-[11px] font-semibold text-r-green">
+                clear fault
+              </span>
+              <span className="font-mono text-[10px] text-r-dim">Restore normal operation</span>
+            </button>
           </div>
         )}
       </div>

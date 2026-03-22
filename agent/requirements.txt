@@ -6,3 +6,4 @@ flask==3.0.0
 openai-whisper
 matplotlib>=3.8.0
 numpy>=1.26.0
+pyyaml>=6.0

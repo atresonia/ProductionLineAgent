@@ -15,6 +15,10 @@ export default function App() {
   const [incidentStart, setIncidentStart] = useState(null) // ms epoch from server ts
   const [incidentEnd,   setIncidentEnd]   = useState(null) // ms epoch from server ts
 
+  // Multi-incident triage tracking
+  const [incidentTotal,   setIncidentTotal]   = useState(0)  // 0 = single incident
+  const [incidentCurrent, setIncidentCurrent] = useState(0)  // 1-based
+
   // Ref so the WS handler always reads the latest value without a stale closure
   const incidentEndRef = useRef(null)
   const setIncidentEndBoth = (val) => {
@@ -32,7 +36,8 @@ export default function App() {
   const [metrics, setMetrics] = useState({
     api:      { error_rate: 0, p95_latency: 0, memory_mb: 0, status: 'unknown', total_requests: 0 },
     frontend: { error_rate: 0, p95_latency: 0, memory_mb: 0, status: 'unknown', total_requests: 0 },
-    fault: 'none',
+    fault:  'none',
+    faults: [],
   })
   const [metricsHistory, setMetricsHistory] = useState({
     error_rate:  [],
@@ -82,11 +87,35 @@ export default function App() {
         setStatus('investigating')
         setIncidentStart(serverMs)      // ← server timestamp, not Date.now()
         setIncidentEndBoth(null)        // reset for new incident
+        setIncidentTotal(0)
+        setIncidentCurrent(0)
         setEntries([])
         setSlackMsgs([])
         setFlashing(true)
         setTimeout(() => setFlashing(false), 2200)
         addEntry({ type, ts, description: ev.description, severity: ev.severity })
+        break
+
+      case 'triage':
+        setIncidentTotal(ev.count || (ev.anomalies || []).length)
+        setIncidentCurrent(1)
+        addEntry({ type, ts, anomalies: ev.anomalies, count: ev.count })
+        break
+
+      case 'incident_switch':
+        setIncidentCurrent(ev.to_index || 0)
+        // Insert a visual separator between incident investigations
+        addEntry({
+          type: 'incident_separator',
+          ts,
+          to_index: ev.to_index,
+          total:    ev.total,
+          label:    `Incident ${ev.to_index} / ${ev.total}`,
+        })
+        break
+
+      case 'cascade_resolved':
+        addEntry({ type, ts, reason: ev.reason })
         break
 
       case 'plan':
@@ -146,9 +175,10 @@ export default function App() {
         break
 
       case 'metrics': {
-        const api = ev.api || {}
-        const fe  = ev.frontend || {}
-        setMetrics({ api, frontend: fe, fault: ev.fault || 'none' })
+        const api    = ev.api || {}
+        const fe     = ev.frontend || {}
+        const faults = Array.isArray(ev.faults) ? ev.faults : (ev.fault && ev.fault !== 'none' ? [ev.fault] : [])
+        setMetrics({ api, frontend: fe, fault: ev.fault || 'none', faults })
         const now = Date.now()
         setMetricsHistory(prev => ({
           error_rate:  [...prev.error_rate.slice(-59),  { t: now, v: api.error_rate  || 0 }],
@@ -198,20 +228,50 @@ export default function App() {
   }, [approvalEntryId])
 
   // ── Trigger fault from UI ────────────────────────────────────────────────
+  // fault: string (single) or array of strings (multi-fault triage)
   const triggerFault = useCallback(async (fault) => {
+    const faults = Array.isArray(fault) ? fault : [fault]
+    // Single "none" → clear endpoint
+    if (faults.length === 1 && faults[0] === 'none') {
+      try {
+        await fetch(`/api/trigger/none`, { method: 'POST' })
+      } catch {
+        await fetch(`http://localhost:8765/trigger/none`, { method: 'POST' })
+      }
+      return
+    }
+    // Multi-fault → POST /trigger body
+    if (faults.length > 1) {
+      try {
+        await fetch(`/api/trigger`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ faults }),
+        })
+      } catch {
+        await fetch(`http://localhost:8765/trigger`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ faults }),
+        })
+      }
+      return
+    }
+    // Single fault → legacy path endpoint
     try {
-      await fetch(`/api/trigger/${fault}`, { method: 'POST' })
+      await fetch(`/api/trigger/${faults[0]}`, { method: 'POST' })
     } catch {
-      await fetch(`http://localhost:8765/trigger/${fault}`, { method: 'POST' })
+      await fetch(`http://localhost:8765/trigger/${faults[0]}`, { method: 'POST' })
     }
   }, [])
 
   // ── Derived service health ────────────────────────────────────────────────
+  const activeFaults = metrics.faults || (metrics.fault && metrics.fault !== 'none' ? [metrics.fault] : [])
   const serviceHealth = {
     frontend: metrics.frontend.status || 'unknown',
     api:      metrics.api.status      || 'unknown',
-    db:       metrics.fault === 'db_down' ? 'degraded'
-              : metrics.fault !== 'none'  ? 'warning'
+    db:       activeFaults.includes('db_down') ? 'degraded'
+              : activeFaults.length > 0        ? 'warning'
               : 'healthy',
   }
 
@@ -226,6 +286,9 @@ export default function App() {
         incidentEnd={incidentEnd}
         serviceHealth={serviceHealth}
         fault={metrics.fault}
+        faults={activeFaults}
+        incidentTotal={incidentTotal}
+        incidentCurrent={incidentCurrent}
         onTrigger={triggerFault}
       />
 
