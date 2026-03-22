@@ -336,18 +336,22 @@ async def _monitor_loop() -> None:
     Debounces — won't re-trigger while an investigation is already running.
     """
     from monitor import check_once
-    recovered = True  # start in recovered state so first anomaly fires immediately
+    # ready=True  → system last seen clean; a new anomaly may trigger an investigation
+    # ready=False → post-incident; blocked until check_once() returns None, which
+    #               only happens once stale error logs age out of its 3-min window
+    ready = True
 
     while True:
         try:
             anomaly = await asyncio.get_running_loop().run_in_executor(None, check_once)
 
-            if anomaly and not _investigation_running:
-                recovered = False
+            if anomaly and not _investigation_running and ready:
+                ready = False
                 await _start_investigation(anomaly)
 
-            elif not anomaly and not recovered:
-                recovered = True
+            elif not anomaly and not ready:
+                # check_once() returned clean → old log entries aged out → unlock
+                ready = True
                 _set_status("monitoring")
                 _emit({
                     "type":      "agent_status",
