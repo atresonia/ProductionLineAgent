@@ -116,8 +116,16 @@ function TopologyDiagram({ serviceHealth }) {
   )
 }
 
+// Faults that directly affect revenue-critical paths → red; others → amber
+const CRITICAL_FAULTS = new Set(['checkout_degraded', 'bad_deploy', 'db_down'])
+
 export default function MetricsPanel({ metrics, history, serviceHealth }) {
   const api = metrics.api || {}
+
+  // Collect all active faults as an array, normalising both legacy and new formats
+  const faultList = metrics.faults?.length > 0
+    ? metrics.faults
+    : (metrics.fault && metrics.fault !== 'none' ? [metrics.fault] : [])
 
   // Derive display color from current value
   const errColor = api.error_rate >= 15  ? '#ff2d55'
@@ -171,14 +179,21 @@ export default function MetricsPanel({ metrics, history, serviceHealth }) {
 
         <TopologyDiagram serviceHealth={serviceHealth} />
 
-        {/* Fault state */}
-        {metrics.fault && metrics.fault !== 'none' && (
-          <div className="bg-r-red-d border border-r-red/20 rounded p-3">
-            <div className="font-mono text-[9px] uppercase tracking-widest text-r-dim mb-1">
-              Active Fault
+        {/* Fault state — show ALL active faults stacked */}
+        {faultList.length > 0 && (
+          <div className="bg-r-raised border border-r-border rounded p-3">
+            <div className="font-mono text-[9px] uppercase tracking-widest text-r-dim mb-2">
+              Active Fault{faultList.length > 1 ? 's' : ''}
             </div>
-            <div className="font-mono text-[12px] font-semibold text-r-red">
-              {metrics.fault}
+            <div className="flex flex-col gap-1.5">
+              {faultList.map(f => (
+                <div key={f} className={`px-2.5 py-1.5 rounded border font-mono text-[11px] font-semibold
+                  ${CRITICAL_FAULTS.has(f)
+                    ? 'bg-r-red-d border-r-red/30 text-r-red'
+                    : 'bg-r-amb-d border-r-amber/30 text-r-amber'}`}>
+                  {f}
+                </div>
+              ))}
             </div>
           </div>
         )}
