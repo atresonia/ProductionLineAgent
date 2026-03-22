@@ -49,8 +49,17 @@ If multiple anomalies are reported, TRIAGE FIRST in Phase 1:
 4. Apply the team's triage rules to determine investigation order.
 5. Explain your decision using the team's language — reference their reasons and rule names.
 6. If business priority conflicts with technical severity, follow business priority and explain why.
-7. Format the triage line as:
-   "Triage: [CRITICAL/BIZ:CRITICAL] <description> — investigating first per '<rule name>'. [HIGH/BIZ:MEDIUM] <description> — queued."
+7. Format your triage output using this style (NO markdown tables):
+
+   🔴 INVESTIGATING FIRST: /checkout (7.8% error rate)
+      Technical: HIGH | Business: CRITICAL ($5,600/min)
+      Rule applied: "Revenue-critical override"
+
+   🟡 QUEUED #2: /products (16.0% error rate)
+      Technical: HIGH | Business: MEDIUM (no direct revenue loss)
+      Rule applied: "Catalog can wait"
+
+   Use 🔴 for BIZ:CRITICAL, 🟡 for BIZ:HIGH or BIZ:MEDIUM. Never use markdown tables.
 
 When multiple endpoints on the same service are failing with different error rates:
 - Do NOT assume the highest error rate is most important.

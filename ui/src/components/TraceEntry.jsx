@@ -65,6 +65,56 @@ function JsonPreview({ data, maxLen = 140 }) {
   )
 }
 
+// ── Simple markdown renderer (bold, headers, lists, tables) ──────────────────
+
+function renderSimpleMarkdown(text) {
+  if (!text) return null
+  return text.split('\n').map((line, i) => {
+    // Table separator rows — skip entirely
+    if (/^\|[\s\-:|]+\|/.test(line)) return null
+    // Table data rows — render as spaced columns
+    if (/^\|.+\|/.test(line)) {
+      const cells = line.split('|').map(c => c.trim()).filter(Boolean)
+      return (
+        <div key={i} className="flex gap-4">
+          {cells.map((c, j) => (
+            <span key={j} className="flex-1" dangerouslySetInnerHTML={{
+              __html: c.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+            }} />
+          ))}
+        </div>
+      )
+    }
+    // ## headers
+    if (/^## (.+)/.test(line)) {
+      return (
+        <div key={i} className="font-semibold text-r-text/80 mt-1.5 mb-0.5 not-italic">
+          {line.slice(3)}
+        </div>
+      )
+    }
+    // Bullet list items
+    if (/^[-*] (.+)/.test(line)) {
+      return (
+        <div key={i} className="flex gap-1.5 ml-2">
+          <span className="text-r-dim flex-shrink-0">•</span>
+          <span dangerouslySetInnerHTML={{
+            __html: line.slice(2).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          }} />
+        </div>
+      )
+    }
+    // Blank line
+    if (!line.trim()) return <br key={i} />
+    // Regular line with bold support
+    return (
+      <span key={i} dangerouslySetInnerHTML={{
+        __html: line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      }} />
+    )
+  }).filter(Boolean)
+}
+
 // ── Entry types ───────────────────────────────────────────────────────────────
 
 function AnomalyEntry({ entry }) {
@@ -160,9 +210,9 @@ function ReasoningEntry({ entry }) {
           <span className="font-mono text-[9px] text-r-dim uppercase tracking-widest">Reasoning</span>
           <Ts ts={entry.ts} />
         </div>
-        <p className="font-mono text-[11px] text-r-text/60 italic leading-relaxed">
-          {entry.text}
-        </p>
+        <div className="font-mono text-[11px] text-r-text/60 italic leading-relaxed flex flex-col gap-0.5">
+          {renderSimpleMarkdown(entry.text)}
+        </div>
       </div>
     </Card>
   )
